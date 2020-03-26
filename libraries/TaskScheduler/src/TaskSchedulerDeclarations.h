@@ -1,5 +1,5 @@
 // Cooperative multitasking library for Arduino
-// Copyright (c) 2015-2017 Anatoli Arkhipenko
+// Copyright (c) 2015-2019 Anatoli Arkhipenko
 
 #include <stddef.h>
 #include <stdint.h>
@@ -12,17 +12,21 @@
 // and should be used in the main sketch depending on the functionality required
 //
 // #define _TASK_TIMECRITICAL      // Enable monitoring scheduling overruns
-// #define _TASK_SLEEP_ON_IDLE_RUN // Enable 1 ms SLEEP_IDLE powerdowns between tasks if no callback methods were invoked during the pass
+// #define _TASK_SLEEP_ON_IDLE_RUN // Enable 1 ms SLEEP_IDLE powerdowns between runs if no callback methods were invoked during the pass
 // #define _TASK_STATUS_REQUEST    // Compile with support for StatusRequest functionality - triggering tasks on status change events in addition to time only
 // #define _TASK_WDT_IDS           // Compile with support for wdt control points and task ids
 // #define _TASK_LTS_POINTER       // Compile with support for local task storage pointer
 // #define _TASK_PRIORITY          // Support for layered scheduling priority
 // #define _TASK_MICRO_RES         // Support for microsecond resolution
-// #define _TASK_STD_FUNCTION      // Support for std::function (ESP8266 and ESP32 ONLY)
+// #define _TASK_STD_FUNCTION      // Support for std::function (ESP8266 ONLY)
 // #define _TASK_DEBUG             // Make all methods and variables public for debug purposes
-// #define _TASK_INLINE			   // Make all methods "inline" - needed to support some multi-tab, multi-file implementations
+// #define _TASK_INLINE            // Make all methods "inline" - needed to support some multi-tab, multi-file implementations
 // #define _TASK_TIMEOUT           // Support for overall task timeout
-// #define _TASK_OO_CALLBACKS      // Support for dynamic callback method binding
+// #define _TASK_OO_CALLBACKS      // Support for callbacks via inheritance
+// #define _TASK_DEFINE_MILLIS     // Force forward declaration of millis() and micros() "C" style
+// #define _TASK_EXPOSE_CHAIN      // Methods to access tasks in the task chain
+
+class Scheduler;
 
 #ifdef _TASK_DEBUG
     #define _TASK_SCOPE  public
@@ -35,22 +39,15 @@
 #define TASK_ONCE               1
 
 #ifdef _TASK_TIMEOUT
-#define TASK_NOTIMEOUT			0
+#define TASK_NOTIMEOUT          0
 #endif
 
 #ifdef _TASK_PRIORITY
-    class Scheduler;
     extern Scheduler* iCurrentScheduler;
 #endif // _TASK_PRIORITY
 
-#if !defined(ARDUINO)
-	extern unsigned long micros(void);
-	extern unsigned long millis(void);
-#endif
-
-
 #ifdef _TASK_INLINE
-#define INLINE	inline
+#define INLINE  inline
 #else
 #define INLINE
 #endif
@@ -104,7 +101,15 @@ typedef std::function<bool()> TaskOnEnable;
 typedef void (*TaskCallback)();
 typedef void (*TaskOnDisable)();
 typedef bool (*TaskOnEnable)();
-#endif
+#endif  // _TASK_STD_FUNCTION
+
+
+#ifdef _TASK_SLEEP_ON_IDLE_RUN
+  typedef void (*SleepCallback)( unsigned long aDuration );
+
+  extern Scheduler* iSleepScheduler;
+  extern SleepCallback iSleepMethod;
+#endif  // _TASK_SLEEP_ON_IDLE_RUN
 
 typedef struct  {
     bool  enabled    : 1;           // indicates that task is enabled or not.
@@ -144,7 +149,7 @@ class Task {
 #endif // _TASK_OO_CALLBACKS
 #endif  // _TASK_STATUS_REQUEST
 
-    INLINE ~Task();
+    virtual INLINE ~Task();
 
 #ifdef _TASK_TIMEOUT
     INLINE void setTimeout(unsigned long aTimeout, bool aReset=false);
@@ -212,8 +217,14 @@ class Task {
 
 #ifdef _TASK_LTS_POINTER
     INLINE void  setLtsPointer(void *aPtr) ;
-    void* getLtsPointer() ;
+    INLINE void* getLtsPointer() ;
 #endif  // _TASK_LTS_POINTER
+
+#ifdef _TASK_EXPOSE_CHAIN
+    INLINE Task*  getPreviousTask() { return iPrev; };  // pointer to the previous task in the chain, NULL if first or not set
+    INLINE Task*  getNextTask()     { return iNext; };  // pointer to the next task in the chain, NULL if last or not set
+#endif // _TASK_EXPOSE_CHAIN
+
 
   _TASK_SCOPE:
     INLINE void reset();
@@ -256,8 +267,8 @@ class Task {
 #endif  // _TASK_LTS_POINTER
 
 #ifdef _TASK_TIMEOUT
-	unsigned long            iTimeout;				 // Task overall timeout
-	unsigned long 			 iStarttime;			 // millis at task start time
+    unsigned long            iTimeout;               // Task overall timeout
+    unsigned long            iStarttime;             // millis at task start time
 #endif // _TASK_TIMEOUT
 };
 
@@ -265,7 +276,7 @@ class Scheduler {
   friend class Task;
   public:
     INLINE Scheduler();
-//	~Scheduler();
+//  ~Scheduler();
     INLINE void init();
     INLINE void addTask(Task& aTask);
     INLINE void deleteTask(Task& aTask);
@@ -273,11 +284,13 @@ class Scheduler {
     INLINE void enableAll(bool aRecursive = true);
     INLINE bool execute();                              // Returns true if none of the tasks' callback methods was invoked (true = idle run)
     INLINE void startNow(bool aRecursive = true);       // reset ALL active tasks to immediate execution NOW.
-    INLINE Task& currentTask() ;
+    INLINE Task& currentTask() ;                        // DEPRICATED
+    INLINE Task* getCurrentTask() ;                     // Returns pointer to the currently active task
     INLINE long timeUntilNextIteration(Task& aTask);    // return number of ms until next iteration of a given Task
 
 #ifdef _TASK_SLEEP_ON_IDLE_RUN
     INLINE void allowSleep(bool aState = true);
+    INLINE void setSleepMethod( SleepCallback aCallback );
 #endif  // _TASK_SLEEP_ON_IDLE_RUN
 
 #ifdef _TASK_LTS_POINTER
@@ -286,6 +299,10 @@ class Scheduler {
 
 #ifdef _TASK_TIMECRITICAL
     INLINE bool isOverrun();
+    INLINE void cpuLoadReset();
+    INLINE unsigned long getCpuLoadCycle(){ return iCPUCycle; };
+    INLINE unsigned long getCpuLoadIdle() { return iCPUIdle; };
+    INLINE unsigned long getCpuLoadTotal();
 #endif  // _TASK_TIMECRITICAL
 
 #ifdef _TASK_PRIORITY
@@ -293,16 +310,27 @@ class Scheduler {
     INLINE static Scheduler& currentScheduler() { return *(iCurrentScheduler); };
 #endif  // _TASK_PRIORITY
 
+#ifdef _TASK_EXPOSE_CHAIN
+    INLINE Task*  getFirstTask() { return iFirst; };       // pointer to the previous task in the chain, NULL if first or not set
+    INLINE Task*  getLastTask()  { return iLast;  };       // pointer to the next task in the chain, NULL if last or not set
+#endif // _TASK_EXPOSE_CHAIN
+
   _TASK_SCOPE:
     Task       *iFirst, *iLast, *iCurrent;        // pointers to first, last and current tasks in the chain
 
 #ifdef _TASK_SLEEP_ON_IDLE_RUN
-    bool        iAllowSleep;                      // indication if putting avr to IDLE_SLEEP mode is allowed by the program at this time.
+    bool        iAllowSleep;                      // indication if putting MC to IDLE_SLEEP mode is allowed by the program at this time.
 #endif  // _TASK_SLEEP_ON_IDLE_RUN
 
 #ifdef _TASK_PRIORITY
     Scheduler  *iHighPriority;                    // Pointer to a higher priority scheduler
 #endif  // _TASK_PRIORITY
+
+#ifdef _TASK_TIMECRITICAL
+    unsigned long iCPUStart;
+    unsigned long iCPUCycle;
+    unsigned long iCPUIdle;
+#endif  // _TASK_TIMECRITICAL
 };
 
 
