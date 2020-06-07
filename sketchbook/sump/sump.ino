@@ -10,9 +10,9 @@
 // Web Server on port 80
 WiFiServer server(80);
 
-const char* heartbeatresource = "/rest/vars/set/2/42/";
+const char* heartbeatresource = "/rest/vars/set/2/77/"; // heartbeat ISY state variable
+const char* sumpresource = "/rest/vars/set/2/78/"; // sump status ISU state variable
 float heartbeat=0; // heartbeat to ISY
-
 
 // time
 unsigned long getisyMillis = 0;
@@ -22,6 +22,7 @@ long resetwifiInterval = 60000;
 char outstr[7];
 int sump = D2;
 int sumpval = 0;
+int oldsumpval = 2;
 
 /*
  * Setup
@@ -36,6 +37,19 @@ void setup(){
 
 void loop(){
 	unsigned long currentMillis = millis();
+/*
+ * Sump status retrieve
+ */
+
+    sumpval = digitalRead(sump);
+    if(sumpval != oldsumpval) {
+        oldsumpval = sumpval;
+        makeHTTPRequest(sumpresource,sumpval);
+        Serial.print("Updating ISY with ");
+        Serial.println(sumpval);
+    }
+
+
 /*
  * Init Wifi if dropped
  */
@@ -65,7 +79,6 @@ if(WiFi.status() == WL_CONNECTED) {
         boolean blank_line = true;
         while (client.connected()) {
             if (client.available()) {
-                sumpval = digitalRead(sump);
                 char c = client.read();
                 if (c == '\n' && blank_line) {
                     client.println("HTTP/1.1 200 OK");
