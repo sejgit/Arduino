@@ -1,5 +1,5 @@
 /*
- *	Dock temperature
+ *	Pond temperature
  *
  *	update SeJ 04 14 2018 specifics to my application
  *	update SeJ 04 21 2018 add password header & heartbeat
@@ -22,18 +22,18 @@
 
 // Web Server on port 80
 WiFiServer server(80);
-String ServerTitle = "Jenkins Lake Temperature";
+String ServerTitle = "Jenkins Pond Temperature";
 
 // ISY
-const char* tempresource = "/rest/vars/set/2/43/"; // NOTE ISY state temp variable
-const char* heartbeatresource = "/rest/vars/set/2/44/"; // NOTE ISY state hb variable
+const char* tempresource = "/rest/vars/set/2/41/"; // NOTE ISY state temp variable
+const char* heartbeatresource = "/rest/vars/set/2/42/"; // NOTE ISY state hb variable
 float heartbeat=0; // heartbeat to ISY
 
 // MQTT
 const char* topic = "sej"; // NOTE main topic
-String clientId = "docktemp"; // NOTE client ID for this unit
-const char* topic_temp = "sej/docktemp/temp"; // NOTE temp topic
-const char* topic_hb = "sej/docktemp/hb"; // NOTE hb topic
+String clientId = "pondtemp"; // NOTE client ID for this unit
+const char* topic_temp = "sej/pondtemp/temp"; // NOTE temp topic
+const char* topic_hb = "sej/pondtemp/hb"; // NOTE hb topic
 char hb_send[4];
 
 WiFiClient espClient;
