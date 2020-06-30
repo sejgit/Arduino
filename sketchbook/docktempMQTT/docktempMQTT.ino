@@ -4,8 +4,8 @@
  *	update SeJ 04 14 2018 specifics to my application
  *	update SeJ 04 21 2018 add password header & heartbeat
  *	update SeJ 04 28 2018 separate docktemp & pondtemp
- *  update SeJ 06 29 2020 add MQTT capability
-*/
+ *  update SeJ 06 29 2020 add MQTT capability -- REFER: [[https://gist.github.com/boverby/d391b689ce787f1713d4a409fb43a0a4][ESP8266 MQTT example]]
+ */
 
 #include <../../../../../../../../../Projects/keys/sej/sej.h>
 #include <ESP8266WiFi.h>
@@ -46,7 +46,12 @@ unsigned long getisyInterval = 40000;
 unsigned long resetwifiInterval = 60000;
 
 // MQTT
-const char* topic = "sej/docktemp";
+const char* topic = "sej";
+String clientId = "docktemp";
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+long mqttLastMsg = 0;
+int mqttValue = 0;
 
 
 /*
@@ -63,11 +68,14 @@ void setup(){
 	DS18B20.begin();
 
 	initWifi();
+    mqttClient.setServer(mqtt_server, mqtt_serverport);
+    mqttClient.setCallback(mqttCallback);
 	getTemperature();
 	tempOld = 0;
 }
 
-
+// TODO add temperature & heartbeat publishing to MQTT
+// REFERENCE [[https://gist.github.com/boverby/d391b689ce787f1713d4a409fb43a0a4][ESP8266 MQTT example]]
 /*
  * Main Loop
  */
@@ -75,6 +83,13 @@ void loop(){
     // Init Wifi if dropped
     if(WiFi.status() != WL_CONNECTED) {
         initWifi();
+    }
+
+    // Init MQTT if dropped
+    if(mqttClient.connected()) {
+        mqttClient.loop();
+    } else {
+        mqttReconnect();
     }
 
     unsigned long currentMillis = millis();
@@ -154,7 +169,7 @@ void loop(){
 // Subroutines:
 
 /*
- * Establish Wi-Fi connection
+ * Establish Wi-Fi connection & start web server
  */
 void initWifi() {
 	Serial.println("");
@@ -182,6 +197,62 @@ void initWifi() {
 	server.begin();
 	Serial.println("Web server running....");
 	}
+}
+
+
+/*
+ * MQTT client reconnect
+ */
+void mqttReconnect() {
+    int timeout = 5 * 4; // 5 seconds
+    while (!mqttClient.connected() && (timeout-- > 0)) {
+        Serial.print("Attempting MQTT connection...");
+
+        // Attempt to connect
+        if (mqttClient.connect(clientId.c_str())) {
+            Serial.println("connected");
+            // Once connected, publish an announcement...
+            mqttClient.publish(topic, ("connected " + clientId).c_str() , true );
+            // ... and resubscribe
+            // topic + clientID + in
+            String subscription;
+            subscription += topic;
+            subscription += "/";
+            subscription += clientId ;
+            subscription += "/in";
+            mqttClient.subscribe(subscription.c_str() );
+            Serial.print("subscribed to : ");
+            Serial.println(subscription);
+        } else {
+            Serial.print("failed, rc=");
+            Serial.print(mqttClient.state());
+            Serial.print(" wifi=");
+            Serial.println(WiFi.status());
+        }
+    }
+}
+
+
+/*
+ * MQTT Callback message
+ */
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    Serial.print("Message arrived [");
+    Serial.print(topic);
+    Serial.print("] ");
+    for (unsigned int i = 0; i < length; i++) {
+        Serial.print((char)payload[i]);
+    }
+    Serial.println();
+
+    // Switch on the LED if an 1 was received as first character
+    if ((char)payload[0] == '1') {
+        digitalWrite(LED_BUILTIN, LOW);   // Turn the LED on (Note that LOW is the voltage level
+        // but actually the LED is on; this is because
+        // it is acive low on the ESP-01)
+    } else {
+        digitalWrite(LED_BUILTIN, HIGH);  // Turn the LED off by making the voltage HIGH
+    }
 }
 
 
