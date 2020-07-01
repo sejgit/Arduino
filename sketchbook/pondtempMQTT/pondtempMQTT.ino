@@ -1,6 +1,9 @@
 /*
  *	Pond temperature
  *
+ *  Written for an ESP8266 D1 mini
+ *  --fqbn esp8266:8266:d1
+ *
  *	update SeJ 04 14 2018 specifics to my application
  *	update SeJ 04 21 2018 add password header & heartbeat
  *	update SeJ 04 28 2018 separate docktemp & pondtemp
@@ -57,6 +60,7 @@ float tempF;
 float tempOld;
 
 // time
+unsigned long currentMillis;
 unsigned long tempMillis = 0;
 unsigned long getisyMillis = 0;
 unsigned long resetwifiMillis = 0;
@@ -103,7 +107,7 @@ void loop(){
         mqttReconnect();
     }
 
-    unsigned long currentMillis = millis();
+    currentMillis = millis();
 
     // Temperature retrieve
     if(currentMillis - tempMillis > tempInterval) {
@@ -143,7 +147,7 @@ void loop(){
 
     // Web Client
 
-    // Listenning for new clients
+    // Listening for new clients
     WiFiClient client = server.available();
     if (client) {
         Serial.println("New client");
