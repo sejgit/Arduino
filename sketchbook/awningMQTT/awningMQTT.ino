@@ -1,25 +1,26 @@
 /*
  *  Awning control & Living room temperature
  *
- *  Written for an ESP8266 TODO insert relay board here
- *  --fqbn esp8266:8266:??? TODO
- *
+ *  Written for an ESP8266 Sonoff Wifi switch
+ *  --fqbn esp8266:8266:generic TODO verify this works
+ *  TODO remove temp programming or add temp sensor
  *  init   SeJ 03 09 2019 specifics to my application
  *  update SeJ 03 24 2019 change to relay
  *  update SeJ 04 07 2019 changes to work on ESP relay
  *  update SeJ 06 30 2020 add MQTT capability -- REFER: [[https://gist.github.com/boverby/d391b689ce787f1713d4a409fb43a0a4][ESP8266 MQTT example]]
-*/
+ *  update SeJ 07 03 2020 modifiy hb to one character
+ */
 
 #include <ESP8266WiFi.h>
 #include <OneWire.h>
-#include <DallasTemperature.h>
+//#include <DallasTemperature.h>
 #include <PubSubClient.h>
 
 /* Passwords & Ports
-* wifi: ssid, password
-* ISY: hash, isy, isyport
-* MQTT mqtt_server, mqtt_serverport
-*/
+ * wifi: ssid, password
+ * ISY: hash, isy, isyport
+ * MQTT mqtt_server, mqtt_serverport
+ */
 #include <../../../../../../../../../Projects/keys/sej/sej.h>
 
 
@@ -35,9 +36,10 @@ float heartbeat=0; // heartbeat to ISY
 
 // MQTT
 const char* topic = "sej"; // NOTE main topic
-String clientId = "docktemp"; // NOTE client ID for this unit
-const char* topic_temp = "sej/docktemp/temp"; // NOTE temp topic
-const char* topic_hb = "sej/docktemp/hb"; // NOTE hb topic
+String clientId = "awning"; // NOTE client ID for this unit
+const char* topic_temp = "sej/awning/temp"; // NOTE temp topic
+const char* topic_control = "sej/awning/control"; // NOTE control topic
+const char* topic_hb = "sej/awning/hb"; // NOTE hb topic
 char hb_send[4];
 
 WiFiClient espClient;
@@ -49,10 +51,10 @@ int mqttValue = 0;
 #define ONE_WIRE_BUS 5
 
 // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
-OneWire oneWire(ONE_WIRE_BUS);
+//OneWire oneWire(ONE_WIRE_BUS);
 
 // Pass our oneWire reference to Dallas Temperature.
-DallasTemperature DS18B20(&oneWire);
+//DallasTemperature DS18B20(&oneWire);
 char temperatureCString[7];
 char temperatureFString[7];
 char outstr[7];
@@ -78,7 +80,7 @@ int val = false; // valid http value received
 // pins
 int pbpower = 12; // Pin D2 GPIO 0 12
 int pbbutton = 13; // Pin D3 GPIO 4 13
-
+int statusled = 16; // status led
 
 /*
  * Setup
@@ -92,7 +94,7 @@ void setup(){
 
     // IC Default 9 bit. If you have troubles consider upping it 12.
     // Ups the delay giving the IC more time to process the temperature measurement
-	DS18B20.begin();
+	//DS18B20.begin();
 
     initWifi();
     mqttClient.setServer(mqtt_server, mqtt_serverport);
@@ -103,12 +105,12 @@ void setup(){
     control = true;
 
     // prepare GPIO4
-  pinMode(pbpower, OUTPUT);
-  digitalWrite(pbpower, LOW);
-  delay(1);
-  pinMode(pbbutton, OUTPUT);
-  digitalWrite(pbbutton, LOW);
-  delay(1);
+    pinMode(pbpower, OUTPUT);
+    digitalWrite(pbpower, LOW);
+    delay(1);
+    pinMode(pbbutton, OUTPUT);
+    digitalWrite(pbbutton, LOW);
+    delay(1);
 }
 
 /*
@@ -160,7 +162,7 @@ void loop(){
         }
         makeHTTPRequest(heartbeatresource,heartbeat);
         if(mqttClient.connected()) {
-            dtostrf(heartbeat, 2, 0, hb_send);
+            itoa(heartbeat, hb_send, 2); // binary format
             mqttClient.publish(topic_hb, hb_send, true);
         }
     }
@@ -189,7 +191,7 @@ void loop(){
         } else if (s.indexOf("/awning/1") != -1) {
             val = true;
             AwningControl();
-            }
+        }
 
         // Respond to HTTP GET
         if(val){
@@ -238,17 +240,17 @@ void initWifi() {
 	Serial.println("");
 
 	if(WiFi.status() != WL_CONNECTED) {
-		 Serial.println("WiFi Failed to connect");
+        Serial.println("WiFi Failed to connect");
 	}
 	else {
-	Serial.print("WiFi connected in: ");
-	Serial.print(millis());
-	Serial.print(", IP address: ");
-	Serial.println(WiFi.localIP());
+        Serial.print("WiFi connected in: ");
+        Serial.print(millis());
+        Serial.print(", IP address: ");
+        Serial.println(WiFi.localIP());
 
-	// Starting the web server
-	server.begin();
-	Serial.println("Web server running....");
+        // Starting the web server
+        server.begin();
+        Serial.println("Web server running....");
 	}
 }
 
@@ -268,14 +270,9 @@ void mqttReconnect() {
             mqttClient.publish(topic, ("connected " + clientId).c_str() , true );
             // ... and resubscribe
             // topic + clientID + in
-            String subscription;
-            subscription += topic;
-            subscription += "/";
-            subscription += clientId ;
-            subscription += "/awningcontrol";
-            mqttClient.subscribe(subscription.c_str() );
+            mqttClient.subscribe(topic_control);
             Serial.print("subscribed to : ");
-            Serial.println(subscription);
+            Serial.println(topic_control);
         } else {
             Serial.print("failed, rc=");
             Serial.print(mqttClient.state());
@@ -328,20 +325,21 @@ void AwningControl() {
  * GetTemperature from DS18B20
  */
 void getTemperature() {
-    do {
-            DS18B20.requestTemperatures();
-            tempC = DS18B20.getTempCByIndex(0);
-            dtostrf(tempC, 2, 2, temperatureCString);
-            tempF = DS18B20.getTempFByIndex(0);
-            dtostrf(tempF, 3, 2, temperatureFString);
-            delay(100);
-        } while (tempC == 85.0 || tempC == (-127.0));
-        Serial.print(ServerTitle);
-        Serial.print("Temperature in Celsius: ");
-        Serial.print(temperatureCString);
-        Serial.print("   Temperature in Fahrenheit: ");
-        Serial.println(temperatureFString);
-    }
+    return;
+    /* do { */
+    /*         DS18B20.requestTemperatures(); */
+    /*         tempC = DS18B20.getTempCByIndex(0); */
+    /*         dtostrf(tempC, 2, 2, temperatureCString); */
+    /*         tempF = DS18B20.getTempFByIndex(0); */
+    /*         dtostrf(tempF, 3, 2, temperatureFString); */
+    /*         delay(100); */
+    /*     } while (tempC == 85.0 || tempC == (-127.0)); */
+    /*     Serial.print(ServerTitle); */
+    /*     Serial.print("Temperature in Celsius: "); */
+    /*     Serial.print(temperatureCString); */
+    /*     Serial.print("   Temperature in Fahrenheit: "); */
+    /*     Serial.println(temperatureFString); */
+}
 
 
 /*

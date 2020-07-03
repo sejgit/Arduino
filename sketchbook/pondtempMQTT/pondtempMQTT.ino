@@ -8,6 +8,7 @@
  *	update SeJ 04 21 2018 add password header & heartbeat
  *	update SeJ 04 28 2018 separate docktemp & pondtemp
  *  update SeJ 06 29 2020 add MQTT capability -- REFER: [[https://gist.github.com/boverby/d391b689ce787f1713d4a409fb43a0a4][ESP8266 MQTT example]]
+ *  update SeJ 07 03 2020 modifiy hb to one character
  */
 
 #include <ESP8266WiFi.h>
@@ -140,7 +141,7 @@ void loop(){
         }
         makeHTTPRequest(heartbeatresource,heartbeat);
         if(mqttClient.connected()) {
-            dtostrf(heartbeat, 2, 0, hb_send);
+            itoa(heartbeat, hb_send, 2); // binary format
             mqttClient.publish(topic_hb, hb_send, true);
         }
     }
