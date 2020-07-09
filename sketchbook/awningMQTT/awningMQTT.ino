@@ -1,14 +1,15 @@
 /*
- *  Awning control & Living room temperature
+ *  Awning control & Living room temperature (not implemented)
  *
  *  Written for an ESP8266 Sonoff Wifi switch
- *  --fqbn esp8266:8266:generic TODO verify this works
- *  TODO remove temp programming or add temp sensor
+ *  --fqbn esp8266:8266:generic
+ *
  *  init   SeJ 03 09 2019 specifics to my application
  *  update SeJ 03 24 2019 change to relay
  *  update SeJ 04 07 2019 changes to work on ESP relay
  *  update SeJ 06 30 2020 add MQTT capability -- REFER: [[https://gist.github.com/boverby/d391b689ce787f1713d4a409fb43a0a4][ESP8266 MQTT example]]
- *  update SeJ 07 03 2020 modifiy hb to one character
+ *  update SeJ 07 03 2020 modifiy hb to one character, last will, monitor
+ *  update SeJ 07 08 2020 move to MQTT only removing REST ISY
  */
 
 #include <ESP8266WiFi.h>
@@ -28,19 +29,32 @@
 WiFiServer server(80);
 String ServerTitle = "Jenkins Living Room Awning";
 
-// ISY
-const char* tempresource = "/rest/vars/set/2/69/"; // NOTE ISY state temp variable
-const char* awningcontrolresource = "/rest/vars/set/2/71/"; // NOTE ISY state control variable
-const char* heartbeatresource = "/rest/vars/set/2/70/"; // NOTE ISY state hb variable
-float heartbeat=0; // heartbeat to ISY
-
 // MQTT
-const char* topic = "sej"; // NOTE main topic
-String clientId = "awning"; // NOTE client ID for this unit
-const char* topic_temp = "sej/awning/temp"; // NOTE temp topic
-const char* topic_control = "sej/awning/control"; // NOTE control topic
-const char* topic_hb = "sej/awning/hb"; // NOTE hb topic
-char hb_send[4];
+const char* topic = "sej"; // main topic
+String clientId = "awning"; // client ID for this unit
+
+const char* topic_temp = "sej/awning/temp"; // temp topic NOTE not implemented
+
+const char* topic_control = "sej/awning/control/trigger"; // control topic
+const char* control_message1 = "ON"; // control message1 only as trigger
+
+const char* topic_monitor = "sej/awning/status/trigger"; // bounce back
+const char* monitor_message1 = "ON"; // monitor message1
+const char* monitor_message2 = "OFF"; // monitor message2
+
+const char* topic_monitor2 = "sej/awning/status/position"; // monitor topic NOTE not implemented
+const char* monitor2_message1 = "IN"; // monitor message1 NOTE would require new poly device
+const char* monitor2_message2 = "OUT"; // monitor message2 NOTE unless use ON OFF
+
+const char* topic_hb = "sej/awning/status/hb"; // hb topic
+const char* hb_message1 = "ON"; // hb message1
+const char* hb_message2 = "OFF"; // hb message2
+
+const char* willTopic = topic; // will topic
+byte willQoS = 0;
+boolean willRetain = false;
+const char* willMessage = ("lost connection " + clientId).c_str();
+float heartbeat=0; // heartbeat to mqtt
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
@@ -51,10 +65,10 @@ int mqttValue = 0;
 #define ONE_WIRE_BUS 5
 
 // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
-//OneWire oneWire(ONE_WIRE_BUS);
+//OneWire oneWire(ONE_WIRE_BUS); //removed for now
 
 // Pass our oneWire reference to Dallas Temperature.
-//DallasTemperature DS18B20(&oneWire);
+//DallasTemperature DS18B20(&oneWire); // removed for now
 char temperatureCString[7];
 char temperatureFString[7];
 char outstr[7];
@@ -65,28 +79,28 @@ float tempOld;
 // time
 unsigned long currentMillis;
 unsigned long tempMillis = 0;
-unsigned long getisyMillis = 0;
 unsigned long resetwifiMillis = 0;
-unsigned long tempInterval = 10000;
-unsigned long getisyInterval = 40000;
+unsigned long tempInterval = 30000; // minimum 10s for DS18B20
 unsigned long resetwifiInterval = 60000;
-
+unsigned long mqttMillis = 0;
+unsigned long mqttInterval = 30000;
 unsigned long awningcontrolMillis = 0;
 unsigned long awningcontrolInterval = 30000;
+
+// awning
 int awningpushtime = 2000;
 int control = true; // allow awning control periodically
-int val = false; // valid http value received
 
-// pins
 int pbpower = 12; // Pin D2 GPIO 0 12
 int pbbutton = 13; // Pin D3 GPIO 4 13
 int statusled = 16; // status led
+
 
 /*
  * Setup
  */
 void setup(){
-	Serial.begin(115200);
+	Serial.begin(9600);
 	delay(10);
 
     pinMode(LED_BUILTIN, OUTPUT);
@@ -94,12 +108,12 @@ void setup(){
 
     // IC Default 9 bit. If you have troubles consider upping it 12.
     // Ups the delay giving the IC more time to process the temperature measurement
-	//DS18B20.begin();
+	//DS18B20.begin(); // removed for now
 
     initWifi();
     mqttClient.setServer(mqtt_server, mqtt_serverport);
     mqttClient.setCallback(mqttCallback);
-	getTemperature();
+	getTemperature(); // does nothing
     tempOld = 0;
 
     control = true;
@@ -117,6 +131,8 @@ void setup(){
  * Main Loop
  */
 void loop(){
+    currentMillis = millis();
+
     // Init Wifi if dropped
     if(WiFi.status() != WL_CONNECTED) {
         initWifi();
@@ -129,41 +145,29 @@ void loop(){
         mqttReconnect();
     }
 
-    currentMillis = millis();
-
     // Temperature retrieve
     if(currentMillis - tempMillis > tempInterval) {
         tempMillis = currentMillis;
         getTemperature();
-    }
-
-    // Temperature to ISY
-    if(currentMillis - getisyMillis > getisyInterval){
-        getisyMillis = currentMillis;
         if (tempOld != tempF){
-            makeHTTPRequest(tempresource,tempF);
-            if(mqttClient.connected()) {
-                mqttClient.publish(topic_temp, temperatureFString, true);
-            }
-
-            Serial.print("Updating ISY with ");
-            Serial.println(temperatureFString);
+            // insert publishing when implemented
         }
     }
 
-    // Heartbeat to ISY
+    // Heartbeat
     if(currentMillis - resetwifiMillis > resetwifiInterval) {
         resetwifiMillis = currentMillis;
         if(heartbeat == 0){
             heartbeat = 1;
+            if(mqttClient.connected()) {
+                mqttClient.publish(topic_hb, monitor_message1 , false);
+            }
         }
         else {
             heartbeat = 0;
-        }
-        makeHTTPRequest(heartbeatresource,heartbeat);
-        if(mqttClient.connected()) {
-            itoa(heartbeat, hb_send, 2); // binary format
-            mqttClient.publish(topic_hb, hb_send, true);
+            if(mqttClient.connected()) {
+                mqttClient.publish(topic_hb, monitor_message2 , false);
+            }
         }
     }
 
@@ -172,51 +176,46 @@ void loop(){
         control = true;
     }
 
-    val = false;
+    // Web Client
+
     // Listening for new clients
     WiFiClient client = server.available();
     if (client) {
         Serial.println("New client");
-
-        // Read the first line of the request
-        String s = client.readStringUntil('\r');
-        Serial.println(s);
-        client.flush();
-
-        // Match the request
-        if (s.indexOf("/awning/0") != -1) {
-            val = true;
-            Serial.print("request awning status: ");
-            Serial.println(( (control) ? "true" : "false"));
-        } else if (s.indexOf("/awning/1") != -1) {
-            val = true;
-            AwningControl();
+        // bolean to locate when the http request ends
+        boolean blank_line = true;
+        while (client.connected()) {
+            if (client.available()) {
+                char c = client.read();
+                if (c == '\n' && blank_line) {
+                    client.println("HTTP/1.1 200 OK");
+                    client.println("Content-Type: text/html");
+                    client.println("Connection: close");
+                    client.println();
+                    // your actual web page that displays temperature
+                    client.println("<!DOCTYPE HTML><html><head></head><body><h1>");
+                    client.println(ServerTitle);
+                    client.println("</h1><h3>Temperature in Celsius: ");
+                    client.println(temperatureCString);
+                    client.println("*C</h3><h3>Temperature in Fahrenheit: ");
+                    client.println(temperatureFString);
+                    client.println("*F</h3></body></html>");
+                    break;
+                }
+                if (c == '\n') {
+                    // when starts reading a new line
+                    blank_line = true;
+                }
+                else if (c != '\r') {
+                    // when finds a character on the current line
+                    blank_line = false;
+                }
+            }
         }
-
-        // Respond to HTTP GET
-        if(val){
-            client.println("HTTP/1.1 200 OK");
-            client.println("Content-Type: text/html");
-            client.println("Connection: close");
-            client.println();
-            // your actual web page that displays temperature
-            client.println("<!DOCTYPE HTML><html><head></head><body><h1>");
-            client.println(ServerTitle);
-            client.println("</h1><h3>Awning control is now ");
-            client.println((control) ? "true" : "false");
-            client.println("</h3><h3>Temperature in Celsius: ");
-            client.println(temperatureCString);
-            client.println("*C</h3><h3>Temperature in Fahrenheit: ");
-            client.println(temperatureFString);
-            client.println("*F</h3></body></html>");
-        }
-
         // closing the client connection
         delay(1);
-        client.flush();
         client.stop();
-        Serial.println("WebClient disconnected");
-        val = false;
+        Serial.println("WebClient disconnected.");
     }
 }
 
@@ -244,7 +243,7 @@ void initWifi() {
 	}
 	else {
         Serial.print("WiFi connected in: ");
-        Serial.print(millis());
+        Serial.print(currentMillis);
         Serial.print(", IP address: ");
         Serial.println(WiFi.localIP());
 
@@ -259,12 +258,11 @@ void initWifi() {
  * MQTT client reconnect
  */
 void mqttReconnect() {
-    int timeout = 5 * 4; // 5 seconds
-    while (!mqttClient.connected() && (timeout-- > 0)) {
+    while (!mqttClient.connected() && (currentMillis - mqttMillis > mqttInterval)) {
         Serial.print("Attempting MQTT connection...");
 
         // Attempt to connect
-        if (mqttClient.connect(clientId.c_str())) {
+        if (mqttClient.connect(clientId.c_str(), willTopic, willQoS, willRetain, willMessage)) {
             Serial.println("connected");
             // Once connected, publish an announcement...
             mqttClient.publish(topic, ("connected " + clientId).c_str() , true );
@@ -278,6 +276,7 @@ void mqttReconnect() {
             Serial.print(mqttClient.state());
             Serial.print(" wifi=");
             Serial.println(WiFi.status());
+            mqttMillis = currentMillis;
         }
     }
 }
@@ -290,13 +289,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.print("Message arrived [");
     Serial.print(topic);
     Serial.print("] ");
+    char mypayload[length+1];
     for (unsigned int i = 0; i < length; i++) {
         Serial.print((char)payload[i]);
+        mypayload[i] = (char)payload[i];
     }
+    mypayload[length] = '\0';
     Serial.println();
 
-    // Signal Awning if an 1 was received as first character
-    if ((char)payload[0] == '1') {
+    if (strcmp((char *)mypayload, (char *)control_message1) == 0) { // AwningTrigger
         AwningControl();
     }
 }
@@ -311,10 +312,15 @@ void AwningControl() {
         digitalWrite(pbpower, HIGH);
         digitalWrite(pbbutton, HIGH);
         Serial.println("**awning button pushed**");
+        mqttClient.publish(topic_monitor, monitor_message1, false);
         delay(awningpushtime);
+
         digitalWrite(pbbutton, LOW);
         digitalWrite(pbpower, LOW);
         Serial.println("**awning button released**");
+        mqttClient.publish(topic_monitor, monitor_message2, true);
+        mqttClient.publish(topic_control, monitor_message2, true); // clear control msg
+
         awningcontrolMillis = currentMillis;
         control = false;
     }
@@ -339,54 +345,4 @@ void getTemperature() {
     /*     Serial.print(temperatureCString); */
     /*     Serial.print("   Temperature in Fahrenheit: "); */
     /*     Serial.println(temperatureFString); */
-}
-
-
-/*
- * Make an HTTP request to ISY
- */
-void makeHTTPRequest(const char* resource, float data) {
-    Serial.print("Connecting to ");
-    Serial.print(isy);
-
-    WiFiClient client;
-    int retries = 5;
-    while(!!!client.connect(isy, isyport) && (retries-- > 0)) {
-        Serial.print(".");
-    }
-    Serial.println();
-    if(!!!client.connected()) {
-        Serial.println("Failed to connect, going back to sleep");
-    }
-
-    Serial.print("Request resource: ");
-    Serial.println(resource);
-    dtostrf(data, 3, 2, outstr);
-    client.print(String("GET ") + resource + outstr +
-                 " HTTP/1.1\r\n" +
-                 "Host: " + isy + "\r\n" +
-                 "Connection: close\r\n" +
-                 "Content-Type: application/x-www-form-urlencoded\r\n" +
-                 "Authorization: Basic " + hash + "\r\n\r\n");
-
-    Serial.println("request sent");
-    while (client.connected()) {
-        String line = client.readStringUntil('\n');
-        if (line == "\r") {
-            Serial.println("headers received");
-            break;
-        }
-    }
-    String line = client.readStringUntil('\n');
-    if (line.startsWith("<?xml version=\"1.0\" encoding=\"UTF-8\"?><RestResponse succeeded=\"true\"><status>200</status></RestResponse>")) {
-        Serial.println("write to ISY successful!");
-    } else {
-        Serial.println("write to ISY has failed");
-    }
-    Serial.println("reply was:");
-	Serial.println("==========");
-	Serial.println(line);
-	Serial.println("==========");
-	Serial.println("closing connection");
-	client.stop();
 }

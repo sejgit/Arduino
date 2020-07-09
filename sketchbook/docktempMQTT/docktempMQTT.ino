@@ -2,19 +2,21 @@
  *	Dock temperature
  *
  *  Written for an ESP8266 D1 mini
- *  --fqbn esp8266:8266:d1
+ *  --fqbn esp8266:esp8266:d1
  *
  *	update SeJ 04 14 2018 specifics to my application
  *	update SeJ 04 21 2018 add password header & heartbeat
  *	update SeJ 04 28 2018 separate docktemp & pondtemp
  *  update SeJ 06 29 2020 add MQTT capability -- REFER: [[https://gist.github.com/boverby/d391b689ce787f1713d4a409fb43a0a4][ESP8266 MQTT example]]
  *  update SeJ 07 03 2020 modifiy hb to one character
+ *  update SeJ 07 08 2020 move to MQTT only removing REST ISY
  */
 
 #include <ESP8266WiFi.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <PubSubClient.h>
+#include <ArduinoJson.h>
 
 /* Passwords & Ports
 * wifi: ssid, password
@@ -28,17 +30,29 @@
 WiFiServer server(80);
 String ServerTitle = "Jenkins Lake Temperature";
 
-// ISY
-const char* tempresource = "/rest/vars/set/2/43/"; // NOTE ISY state temp variable
-const char* heartbeatresource = "/rest/vars/set/2/44/"; // NOTE ISY state hb variable
-float heartbeat=0; // heartbeat to ISY
-
 // MQTT
-const char* topic = "sej"; // NOTE main topic
-String clientId = "docktemp"; // NOTE client ID for this unit
-const char* topic_temp = "sej/docktemp/temp"; // NOTE temp topic
-const char* topic_hb = "sej/docktemp/hb"; // NOTE hb topic
-char hb_send[4];
+const char* topic = "sej"; // main topic
+String clientId = "docktemp"; // client ID for this unit
+
+const char* topic_temp = "sej/docktemp/status/temp"; // temp topic
+
+const char* topic_control = "sej/docktemp/control/led"; // control topic
+const char* control_message1 = "ON"; // control message1
+const char* control_message2 = "OFF"; // control message2
+
+const char* topic_monitor = "sej/docktemp/status/led"; // monitor topic
+const char* monitor_message1 = "ON"; // monitor message1
+const char* monitor_message2 = "OFF"; // monitor message2
+
+const char* topic_hb = "sej/docktemp/status/hb"; // hb topic
+const char* hb_message1 = "ON"; // hb message1
+const char* hb_message2 = "OFF"; // hb message2
+
+const char* willTopic = topic; // will topic
+byte willQoS = 0;
+boolean willRetain = false;
+const char* willMessage = ("lost connection " + clientId).c_str();
+float heartbeat=0; // heartbeat to mqtt
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
@@ -63,11 +77,11 @@ float tempOld;
 // time
 unsigned long currentMillis;
 unsigned long tempMillis = 0;
-unsigned long getisyMillis = 0;
 unsigned long resetwifiMillis = 0;
-unsigned long tempInterval = 10000;
-unsigned long getisyInterval = 40000;
+unsigned long tempInterval = 30000;  // minimum 10s for DS18B20
 unsigned long resetwifiInterval = 60000;
+unsigned long mqttMillis = 0;
+unsigned long mqttInterval = 30000;
 
 
 /*
@@ -96,6 +110,8 @@ void setup(){
  * Main Loop
  */
 void loop(){
+    currentMillis = millis();
+
     // Init Wifi if dropped
     if(WiFi.status() != WL_CONNECTED) {
         initWifi();
@@ -108,41 +124,41 @@ void loop(){
         mqttReconnect();
     }
 
-    currentMillis = millis();
-
-    // Temperature retrieve
+    // Temperature retrieve & publish
     if(currentMillis - tempMillis > tempInterval) {
         tempMillis = currentMillis;
         getTemperature();
-    }
-
-    // Temperature to ISY
-    if(currentMillis - getisyMillis > getisyInterval){
-        getisyMillis = currentMillis;
         if (tempOld != tempF){
-            makeHTTPRequest(tempresource,tempF);
             if(mqttClient.connected()) {
-                mqttClient.publish(topic_temp, temperatureFString, true);
-            }
+                const size_t capacity = JSON_OBJECT_SIZE(1);
+                StaticJsonDocument<capacity> doc;
+                JsonObject object = doc.to<JsonObject>();
 
-            Serial.print("Updating ISY with ");
+                object["Temperature"] = tempF;
+
+                char buffer[256];
+                serializeJson(doc, buffer);
+                mqttClient.publish(topic_temp, buffer, true);
+            }
+            Serial.print("Updating temp: ");
             Serial.println(temperatureFString);
         }
     }
 
-    // Heartbeat to ISY
+    // Heartbeat
     if(currentMillis - resetwifiMillis > resetwifiInterval) {
         resetwifiMillis = currentMillis;
         if(heartbeat == 0){
             heartbeat = 1;
+            if(mqttClient.connected()) {
+                mqttClient.publish(topic_hb, monitor_message1 , false);
+            }
         }
         else {
             heartbeat = 0;
-        }
-        makeHTTPRequest(heartbeatresource,heartbeat);
-        if(mqttClient.connected()) {
-            itoa(heartbeat, hb_send, 2); // binary format
-            mqttClient.publish(topic_hb, hb_send, true);
+            if(mqttClient.connected()) {
+                mqttClient.publish(topic_hb, monitor_message2 , false);
+            }
         }
     }
 
@@ -228,30 +244,24 @@ void initWifi() {
  * MQTT client reconnect
  */
 void mqttReconnect() {
-    int timeout = 5 * 4; // 5 seconds
-    while (!mqttClient.connected() && (timeout-- > 0)) {
+    while (!mqttClient.connected() && (currentMillis - mqttMillis > mqttInterval)) {
         Serial.print("Attempting MQTT connection...");
 
         // Attempt to connect
-        if (mqttClient.connect(clientId.c_str())) {
+        if (mqttClient.connect(clientId.c_str(), clientId.c_str(), password,
+                               willTopic, willQoS, willRetain, willMessage)) {
             Serial.println("connected");
             // Once connected, publish an announcement...
             mqttClient.publish(topic, ("connected " + clientId).c_str() , true );
-            // ... and resubscribe
-            // topic + clientID + in
-            String subscription;
-            subscription += topic;
-            subscription += "/";
-            subscription += clientId ;
-            subscription += "/in";
-            mqttClient.subscribe(subscription.c_str() );
+            mqttClient.subscribe(topic_control);
             Serial.print("subscribed to : ");
-            Serial.println(subscription);
+            Serial.println(topic_control);
         } else {
             Serial.print("failed, rc=");
             Serial.print(mqttClient.state());
             Serial.print(" wifi=");
             Serial.println(WiFi.status());
+            mqttMillis = currentMillis;
         }
     }
 }
@@ -264,18 +274,23 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.print("Message arrived [");
     Serial.print(topic);
     Serial.print("] ");
+    char mypayload[length+1];
     for (unsigned int i = 0; i < length; i++) {
         Serial.print((char)payload[i]);
+        mypayload[i] = (char)payload[i];
     }
+    mypayload[length] = '\0';
     Serial.println();
 
-    // Switch on the LED if an 1 was received as first character
-    if ((char)payload[0] == '1') {
+    // Switch on the LED if an ON received
+    if (strcmp((char *)mypayload, (char *)control_message1) == 0) {
         digitalWrite(LED_BUILTIN, LOW);   // Turn the LED on (Note that LOW is the voltage level
         // but actually the LED is on; this is because
         // it is acive low on the ESP-01)
-    } else {
+        mqttClient.publish(topic_monitor, monitor_message1, true);
+    } else if (strcmp((char *)mypayload, (char *)control_message2) == 0) {
         digitalWrite(LED_BUILTIN, HIGH);  // Turn the LED off by making the voltage HIGH
+        mqttClient.publish(topic_monitor, monitor_message2, true);
     }
 }
 
@@ -297,54 +312,4 @@ void getTemperature() {
 	Serial.print(temperatureCString);
 	Serial.print("   Temperature in Fahrenheit: ");
 	Serial.println(temperatureFString);
-}
-
-
-/*
- * Make an HTTP request to ISY
- */
-void makeHTTPRequest(const char* resource, float data) {
-    Serial.print("Connecting to ");
-    Serial.print(isy);
-
-    WiFiClient client;
-    int retries = 5;
-    while(!!!client.connect(isy, isyport) && (retries-- > 0)) {
-        Serial.print(".");
-    }
-    Serial.println();
-    if(!!!client.connected()) {
-        Serial.println("Failed to connect, going back to sleep");
-    }
-
-    Serial.print("Request resource: ");
-    Serial.println(resource);
-    dtostrf(data, 3, 2, outstr);
-    client.print(String("GET ") + resource + outstr +
-                 " HTTP/1.1\r\n" +
-                 "Host: " + isy + "\r\n" +
-                 "Connection: close\r\n" +
-                 "Content-Type: application/x-www-form-urlencoded\r\n" +
-                 "Authorization: Basic " + hash + "\r\n\r\n");
-
-    Serial.println("request sent");
-    while (client.connected()) {
-        String line = client.readStringUntil('\n');
-        if (line == "\r") {
-            Serial.println("headers received");
-            break;
-        }
-    }
-    String line = client.readStringUntil('\n');
-    if (line.startsWith("<?xml version=\"1.0\" encoding=\"UTF-8\"?><RestResponse succeeded=\"true\"><status>200</status></RestResponse>")) {
-        Serial.println("write to ISY successful!");
-    } else {
-        Serial.println("write to ISY has failed");
-    }
-    Serial.println("reply was:");
-	Serial.println("==========");
-	Serial.println(line);
-	Serial.println("==========");
-	Serial.println("closing connection");
-	client.stop();
 }
