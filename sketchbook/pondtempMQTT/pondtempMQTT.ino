@@ -78,7 +78,7 @@ float tempOld;
 unsigned long currentMillis;
 unsigned long tempMillis = 0;
 unsigned long resetwifiMillis = 0;
-unsigned long tempInterval = 3000; // minimum 10s for DS18B20
+unsigned long tempInterval = 30000; // minimum 10s for DS18B20
 unsigned long resetwifiInterval = 60000;
 unsigned long mqttMillis = 0;
 unsigned long mqttInterval = 30000;
@@ -130,11 +130,10 @@ void loop(){
         getTemperature();
         if (tempOld != tempF){
             if(mqttClient.connected()) {
-                const size_t capacity = JSON_OBJECT_SIZE(1);
+                const size_t capacity = JSON_OBJECT_SIZE(2);
                 StaticJsonDocument<capacity> doc;
-                JsonObject object = doc.to<JsonObject>();
-
-                object["Temperature"] = tempF;
+                JsonObject obj = doc.createNestedObject("DS18B20");
+                obj["Temperature"] = tempF;
 
                 char buffer[256];
                 serializeJson(doc, buffer);
@@ -151,13 +150,13 @@ void loop(){
         if(heartbeat == 0){
             heartbeat = 1;
             if(mqttClient.connected()) {
-                mqttClient.publish(topic_hb, monitor_message1 , false);
+                mqttClient.publish(topic_hb, monitor_message1 , true);
             }
         }
         else {
             heartbeat = 0;
             if(mqttClient.connected()) {
-                mqttClient.publish(topic_hb, monitor_message2 , false);
+                mqttClient.publish(topic_hb, monitor_message2 , true);
             }
         }
     }
