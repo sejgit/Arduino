@@ -21,7 +21,35 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <WiFiUdp.h>
+#include <TimeLib.h>
 
+
+/*
+ * Time
+ */
+// NTP Servers:
+static const char ntpServerName[] = "us.pool.ntp.org";
+//static const char ntpServerName[] = "time.nist.gov";
+
+const int timeZone = -5;     // Central European Time
+//const int timeZone = -5;  // Eastern Standard Time (USA)
+//const int timeZone = -4;  // Eastern Daylight Time (USA)
+//const int timeZone = -8;  // Pacific Standard Time (USA)
+//const int timeZone = -7;  // Pacific Daylight Time (USA)
+
+WiFiUDP Udp;
+unsigned int localPort = 8888;  // local port to listen for UDP packets
+
+time_t getNtpTime();
+const char* defaultTime = "00:00:00";
+char stringTime[10];
+int oldmin = 99;
+
+
+/*
+ * Display
+ */
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 
@@ -29,18 +57,23 @@
 #define OLED_RESET -1 // Reset pin # or -1 if none
 Adafruit_SSD1306 display (SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+
 /* Passwords & Ports
-* wifi: ssid, password
-* ISY: hash, isy, isyport
-* MQTT mqtt_server, mqtt_serverport
-*/
+ * wifi: ssid, password
+ * ISY: hash, isy, isyport
+ * MQTT mqtt_server, mqtt_serverport
+ */
 #include <../../../../../../../../../Projects/keys/sej/sej.h>
+
 
 // Web Server on port 80
 WiFiServer server(80);
 String ServerTitle = "Jenkins FishTank";
 
-// MQTT
+
+/*
+ *  MQTT
+ */
 const char* topic = "sej"; //  main topic
 String clientId = "fishtank"; // client ID for this unit
 
@@ -66,6 +99,7 @@ PubSubClient mqttClient(espClient);
 long mqttLastMsg = 0;
 int mqttValue = 0;
 
+
 // Data wire is plugged into pin D7 on the ESP8266 12-E - GPIO 13
 #define ONE_WIRE_BUS 13
 
@@ -78,7 +112,10 @@ float tempC;
 float tempF;
 float tempOld;
 
-// time
+
+/*
+ * time
+ */
 unsigned long currentMillis = 0;
 unsigned long tempMillis = 0;
 const long tempInterval = 30000; // minimum 10s for DS18B20
@@ -93,10 +130,17 @@ unsigned long relayMillis = 0;
 const long relayInterval = 30000;
 bool relayState = false;
 
-// IO
+
+/*
+ * IO
+ */
 // LED_BUILTIN is D0 on ESP-12E
 int relay = D6; // power relay
 
+
+/*
+ * Setup
+ */
 void setup() {
     Serial.println("Boot Start.");
 
@@ -183,6 +227,11 @@ void setup() {
     display.println("OTA Ready.");
     display.display();
 
+    Udp.begin(localPort);
+    setSyncProvider(getNtpTime);
+    setSyncInterval(300);
+    sprintf(stringTime, "%s", defaultTime);
+
     mqttClient.setServer(mqtt_server, mqtt_serverport);
     mqttClient.setCallback(mqttCallback);
     initMQTT();
@@ -202,6 +251,9 @@ void setup() {
 }
 
 
+/*
+ * loop
+ */
 void loop() {
     ArduinoOTA.handle();
 
@@ -249,22 +301,25 @@ void loop() {
         }
     }
 
+    // time
+    if(timeStatus() == timeSet) {
+        sprintf(stringTime, "%02d:%02d", hour(), minute());
+        if(oldmin != minute()){
+            oldmin = minute();
+            display.setTextSize(2);
+            display.setCursor(0,0);
+            display.print(stringTime);
+            display.display();
+        }
+    } else {
+        sprintf(stringTime, "%s", defaultTime);
+    }
+
     // relay control
     if(currentMillis - relayMillis > relayInterval) {
         relayMillis = currentMillis;
         relayState = not(relayState);
-        digitalWrite(relay, !relayState); // reverse logic for relay
-        Serial.print("Relay: ");
-        Serial.print(monitor_message[!relayState]);
-        display.setTextSize(2);
-        display.setCursor(0,48);
-        display.print("relay:");
-        display.print(monitor_message[!relayState]);
-        display.print(" ");
-        display.display();
-        if(mqttClient.connected()) {
-            mqttClient.publish(topic_monitor, monitor_message[!relayState], true);
-        }
+        updateRelay();
     }
 
     // Temperature retrieve & publish
@@ -277,7 +332,7 @@ void loop() {
             Serial.print("   Temp in Fahrenheit: ");
             Serial.println(tempF,2);
 
-            display.setCursor(0,0);
+            display.setCursor(0,16);
             display.setTextSize(2);
             display.print("int:");
             display.print(tempF,2);
@@ -321,6 +376,8 @@ void loop() {
                     client.println(tempF,2);
                     client.println("*F</h3><h3>Relay State: ");
                     client.println(relayState, BIN);
+                    client.println("</h3><h3>");
+                    client.println(stringTime);
                     client.println("</h3></body></html>");
                     break;
                 }
@@ -341,6 +398,7 @@ void loop() {
     }
 
 }
+
 
 // Subroutines
 
@@ -435,13 +493,30 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     // Switch on the RELAY if an ON received
     if (strcmp((char *)mypayload, (char *)control_message[0]) == 0) {
         relayState = true;
-        digitalWrite(relay, !relayState);   // relay is reverse logic
-        mqttClient.publish(topic_monitor, monitor_message[0], true);
+        updateRelay();
     } else if (strcmp((char *)mypayload, (char *)control_message[1]) == 0) {
         relayState = false;
-        digitalWrite(relay, !relayState);  // relay is reverse logic
-        mqttClient.publish(topic_monitor, monitor_message[1], true);
+        updateRelay();
     }
+}
+
+
+/*
+ * update Relay output
+ */
+void updateRelay() {
+   digitalWrite(relay, !relayState); // reverse logic for relay
+   Serial.print("Relay: ");
+   Serial.print(monitor_message[!relayState]);
+   display.setTextSize(2);
+   display.setCursor(0,48);
+   display.print("relay:");
+   display.print(monitor_message[!relayState]);
+   display.print(" ");
+   display.display();
+   if(mqttClient.connected()) {
+       mqttClient.publish(topic_monitor, monitor_message[!relayState], true);
+   }
 }
 
 
@@ -455,4 +530,56 @@ void getTemperature() {
 		tempF = DS18B20.getTempFByIndex(0);
 		delay(100);
 	} while (tempC == 85.0 || tempC == (-127.0));
+}
+
+/*-------- NTP code ----------*/
+
+const int NTP_PACKET_SIZE = 48; // NTP time is in the first 48 bytes of message
+byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming & outgoing packets
+
+time_t getNtpTime()
+{
+  IPAddress ntpServerIP; // NTP server's ip address
+
+  while (Udp.parsePacket() > 0) ; // discard any previously received packets
+  WiFi.hostByName(ntpServerName, ntpServerIP);
+  sendNTPpacket(ntpServerIP);
+  uint32_t beginWait = millis();
+  while (millis() - beginWait < 1500) {
+    int size = Udp.parsePacket();
+    if (size >= NTP_PACKET_SIZE) {
+      Udp.read(packetBuffer, NTP_PACKET_SIZE);  // read packet into the buffer
+      unsigned long secsSince1900;
+      // convert four bytes starting at location 40 to a long integer
+      secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
+      secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
+      secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
+      secsSince1900 |= (unsigned long)packetBuffer[43];
+      return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
+    }
+  }
+  return 0; // return 0 if unable to get the time
+}
+
+// send an NTP request to the time server at the given address
+void sendNTPpacket(IPAddress &address)
+{
+  // set all bytes in the buffer to 0
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[1] = 0;     // Stratum, or type of clock
+  packetBuffer[2] = 6;     // Polling Interval
+  packetBuffer[3] = 0xEC;  // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12]  = 49;
+  packetBuffer[13]  = 0x4E;
+  packetBuffer[14]  = 49;
+  packetBuffer[15]  = 52;
+  // all NTP fields have been given values, now
+  // you can send a packet requesting a timestamp:
+  Udp.beginPacket(address, 123); //NTP requests are to port 123
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
 }
