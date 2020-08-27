@@ -23,6 +23,8 @@
 #include <Adafruit_SSD1306.h>
 #include <WiFiUdp.h>
 #include <TimeLib.h>
+#include <Timezone.h>
+#include <LittleFS.h>
 
 
 /*
@@ -32,11 +34,17 @@
 static const char ntpServerName[] = "us.pool.ntp.org";
 //static const char ntpServerName[] = "time.nist.gov";
 
-const int timeZone = -5;     // Central European Time
+const int timeZone = 0;     // use UTC due to Timezone corr
 //const int timeZone = -5;  // Eastern Standard Time (USA)
 //const int timeZone = -4;  // Eastern Daylight Time (USA)
 //const int timeZone = -8;  // Pacific Standard Time (USA)
 //const int timeZone = -7;  // Pacific Daylight Time (USA)
+
+// US Eastern Time Zone (New York, Detroit)
+TimeChangeRule myDST = {"EDT", Second, Sun, Mar, 2, -240};    // Daylight time = UTC - 4 hours
+TimeChangeRule mySTD = {"EST", First, Sun, Nov, 2, -300};     // Standard time = UTC - 5 hours
+Timezone myTZ(myDST, mySTD);
+TimeChangeRule *tcr;        // pointer to the time change rule, use to get TZ abbrev
 
 WiFiUDP Udp;
 unsigned int localPort = 8888;  // local port to listen for UDP packets
@@ -77,16 +85,35 @@ String ServerTitle = "Jenkins FishTank";
 const char* topic = "sej"; //  main topic
 String clientId = "fishtank"; // client ID for this unit
 
-const char* topic_temp = "sej/fishtank/status/temp"; // temp topic
+// MQTT topics
+const char* topic_status_temp = "sej/fishtank/status/temp"; // temp reading topic
+const char* topic_status_templow = "sej/fishtank/status/templow"; // temp status low topic
+const char* topic_status_temphigh = "sej/fishtank/status/temphigh"; // temp status hi topic
+const char* topic_status_tempalarm = "sej/fishtank/status/tempalarm"; // temp status alarm topic
+const char* message_status_tempalarm[] = {"OK", "LOW", "HIGH"};
 
-const char* topic_control = "sej/fishtank/control/relay"; // control topic
-const char* control_message[] = {"ON", "OFF"};
+const char* topic_control_templow = "sej/fishtank/control/templow"; // temp  control low topic
+const char* topic_control_temphigh = "sej/fishtank/control/temphigh"; // temp  control high topic
+const char* topic_control_tempalarm = "sej/fishtank/control/tempalarm"; // temp control alarm topic
+const char* message_control_tempalarm[] = {"RESET"};
+int templow;
+int temphigh;
+int tempalarm;
 
-const char* topic_monitor = "sej/fishtank/status/relay"; // monitor topic
-const char* monitor_message[] = {"ON", "OFF"};
+const char* topic_status_relay = "sej/fishtank/status/relay"; // status relay state topic
+const char* message_status_relay[] = {"ON", "OFF"};
+const char* topic_status_relayon = "sej/fishtank/status/relayon"; // status relay on topic
+const char* topic_status_relayoff = "sej/fishtank/status/relayoff"; // status relay off topic
 
-const char* topic_hb = "sej/fishtank/status/hb"; // hb topic
-const char* hb_message[] = {"ON", "OFF"};
+const char* topic_control_relay = "sej/fishtank/control/relay"; // control relay state topic
+const char* message_control_relay[] = {"ON", "OFF"};
+const char* topic_control_relayon = "sej/fishtank/control/relayon"; // control relay on topic
+const char* topic_control_relayoff = "sej/fishtank/control/relayoff"; // control relay off topic
+int relayon;
+int relayoff;
+
+const char* topic_status_hb = "sej/fishtank/status/hb"; // hb topic
+const char* message_status_hb[] = {"ON", "OFF"};
 
 const char* willTopic = topic; // will topic
 byte willQoS = 0;
@@ -98,7 +125,6 @@ WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 long mqttLastMsg = 0;
 int mqttValue = 0;
-
 
 // Data wire is plugged into pin D7 on the ESP8266 12-E - GPIO 13
 #define ONE_WIRE_BUS 13
@@ -114,7 +140,7 @@ float tempOld;
 
 
 /*
- * time
+ * timers
  */
 unsigned long currentMillis = 0;
 unsigned long tempMillis = 0;
@@ -124,7 +150,7 @@ const long mqttInterval = 30000;
 unsigned long hbMillis = 0;
 const long hbInterval = 60000;
 unsigned long ledMillis = 0;
-const long ledInterval = 1000;
+const long ledInterval = 3000;
 bool ledState = false;
 unsigned long relayMillis = 0;
 const long relayInterval = 30000;
@@ -142,10 +168,12 @@ int relay = D6; // power relay
  * Setup
  */
 void setup() {
-    Serial.println("Boot Start.");
+    Serial.println(F("Boot Start."));
 
     pinMode(LED_BUILTIN, OUTPUT);
     pinMode(relay, OUTPUT);
+    digitalWrite(relay, !relayState); // reverse logic for relay
+
 
     Serial.begin(9600);
     delay(10);
@@ -164,87 +192,136 @@ void setup() {
     display.clearDisplay();
     display.setTextColor(WHITE, BLACK);
     display.setCursor(0,0);
-    initWifi();
-    while (WiFi.waitForConnectResult() != WL_CONNECTED) {
-        Serial.println("Initial Connection Failed! Rebooting...");
-        display.println("Initial Connection Failed!");
-        display.println("Rebooting...");
-        display.display();
-        delay(5000);
-        ESP.restart();
-    }
+    display.setTextSize(1);
+                   initWifi();
+                   while (WiFi.waitForConnectResult() != WL_CONNECTED) {
+                       Serial.println(F("Initial Connection Failed! Rebooting..."));
+                       display.println(F("Initial Connection Failed!"));
+                       display.println(F("Rebooting..."));
+                       display.display();
+                       delay(5000);
+                       ESP.restart();
+                   }
 
-    // Port defaults to 8266
-    // ArduinoOTA.setPort(8266);
+                   // Port defaults to 8266
+                   // ArduinoOTA.setPort(8266);
 
-    // Hostname defaults to esp8266-[ChipID]
-    // ArduinoOTA.setHostname("myesp8266");
+                   // Hostname defaults to esp8266-[ChipID]
+                   // ArduinoOTA.setHostname("myesp8266");
 
-    // No authentication by default
-    // ArduinoOTA.setPassword("admin");
+                   // No authentication by default
+                   // ArduinoOTA.setPassword("admin");
 
-    // Password can be set with it's md5 value as well
-    // MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
-    // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
+                   // Password can be set with it's md5 value as well
+                   // MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
+                   // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
 
-    ArduinoOTA.onStart([]() {
-    String type;
-    if (ArduinoOTA.getCommand() == U_FLASH) {
-      type = "sketch";
-    } else { // U_FS
-      type = "filesystem";
-    }
+                   ArduinoOTA.onStart([]() {
+                           String type;
+                           if (ArduinoOTA.getCommand() == U_FLASH) {
+                               type = "sketch";
+                           } else { // U_FS
+                               type = "filesystem";
+                           }
 
-    // NOTE: if updating FS this would be the place to unmount FS using FS.end()
-    Serial.println("Start updating " + type);
-    });
+                           // NOTE: if updating FS this would be the place to unmount FS using FS.end()
+                           LittleFS.end();
+                           Serial.println("Start updating " + type);
+                       });
 
-    ArduinoOTA.onEnd([]() {
-            Serial.println("\nEnd");
-    });
+                   ArduinoOTA.onEnd([]() {
+                           Serial.println("\nEnd");
+                       });
 
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-            Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-    });
+                   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+                           Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+                       });
 
-    ArduinoOTA.onError([](ota_error_t error) {
-            Serial.printf("Error[%u]: ", error);
-            if (error == OTA_AUTH_ERROR) {
-                Serial.println("Auth Failed");
-            } else if (error == OTA_BEGIN_ERROR) {
-                Serial.println("Begin Failed");
+                   ArduinoOTA.onError([](ota_error_t error) {
+                           Serial.printf("Error[%u]: ", error);
+                           if (error == OTA_AUTH_ERROR) {
+                               Serial.println(F("Auth Failed"));
+} else if (error == OTA_BEGIN_ERROR) {
+                Serial.println(F("Begin Failed"));
             } else if (error == OTA_CONNECT_ERROR) {
-                Serial.println("Connect Failed");
+                Serial.println(F("Connect Failed"));
             } else if (error == OTA_RECEIVE_ERROR) {
-                Serial.println("Receive Failed");
+                Serial.println(F("Receive Failed"));
             } else if (error == OTA_END_ERROR) {
-                Serial.println("End Failed");
+                Serial.println(F("End Failed"));
             }
     });
 
+    // OTA
     ArduinoOTA.begin();
-    Serial.println("OTA Ready.");
-    display.println("OTA Ready.");
+    Serial.println(F("OTA Ready."));
+    display.println(F("OTA Ready."));
     display.display();
 
+    // time
     Udp.begin(localPort);
     setSyncProvider(getNtpTime);
     setSyncInterval(300);
     sprintf(stringTime, "%s", defaultTime);
 
+    // MQTT
     mqttClient.setServer(mqtt_server, mqtt_serverport);
     mqttClient.setCallback(mqttCallback);
     initMQTT();
 
-    Serial.println("DS18B20 Start.");
-    display.println("DS18B20 Start.");
+    // DS18B20
+    Serial.println(F("DS18B20 Start."));
+    display.println(F("DS18B20 Start."));
     display.display();
     DS18B20.begin();
     getTemperature();
     tempOld = 0;
 
-    Serial.println("Boot complete.");
-    display.println("Boot Complete.");
+    // LittleFS
+    LittleFSConfig cfg;
+    cfg.setAutoFormat(false);
+    LittleFS.setConfig(cfg);
+    LittleFS.begin();
+    Serial.println(F("Loading config"));
+    File f = LittleFS.open("/Fishtank.cnf", "r");
+    if (!f) {
+        //File does not exist -- first run or someone called format()
+        //Will not create file; run save code to actually do so (no need here since
+        //it's not changed)
+        Serial.println(F("Failed to open config file"));
+        templow = 75;
+        temphigh = 88;
+        tempalarm = 0;
+        relayon = 0545;
+        relayoff = 2045; // defaults
+    }
+    while (f.available()) {
+        String key = f.readStringUntil('=');
+        String value = f.readStringUntil('\r');
+        f.read();
+        Serial.println(key + F(" = [") + value + ']');
+        Serial.println(key.length());
+        if (key == F("templow")) {
+            templow = value.toInt();
+        }
+        if (key == F("temphigh")) {
+            temphigh = value.toInt();
+        }
+        if (key == F("tempalarm")) {
+            tempalarm = value.toInt();
+        }
+        if (key == F("relayon")) {
+            relayon = value.toInt();
+        }
+        if (key == F("relayoff")) {
+            relayoff = value.toInt();
+        }
+    }
+f.close();
+
+    // clean-up
+    Serial.println(F("Boot complete."));
+    display.println(F("Boot Complete."));
     display.display();
     delay(1000);
     display.clearDisplay();
@@ -264,8 +341,9 @@ void loop() {
         display.clearDisplay();
         display.setTextColor(WHITE, BLACK);
         display.setCursor(0,0);
-        Serial.println("Reconnecting WiFi.");
-        display.println("Reconnecting WiFi.");
+        display.setTextSize(1);
+        Serial.println(F("Reconnecting WiFi."));
+        display.println(F("Reconnecting WiFi."));
         display.display();
         initWifi();
         display.clearDisplay();
@@ -278,8 +356,9 @@ void loop() {
         display.clearDisplay();
         display.setTextColor(WHITE, BLACK);
         display.setCursor(0,0);
-        Serial.println("Reconnecting MQTT.");
-        display.println("Reconnecting MQTT.");
+        display.setTextSize(1);
+        Serial.println(F("Reconnecting MQTT."));
+        display.println(F("Reconnecting MQTT."));
         display.display();
         initMQTT();
         display.clearDisplay();
@@ -297,13 +376,14 @@ void loop() {
         hbMillis = currentMillis;
         heartbeat = not(heartbeat);
         if(mqttClient.connected()) {
-            mqttClient.publish(topic_hb, hb_message[heartbeat] , true);
+            mqttClient.publish(topic_status_hb, message_status_hb[heartbeat] , true);
         }
     }
 
     // time
     if(timeStatus() == timeSet) {
-        sprintf(stringTime, "%02d:%02d", hour(), minute());
+        time_t local = myTZ.toLocal(now(), &tcr);
+        sprintf(stringTime, "%02d:%02d", hour(local), minute(local));
         if(oldmin != minute()){
             oldmin = minute();
             display.setTextSize(2);
@@ -318,7 +398,7 @@ void loop() {
     // relay control
     if(currentMillis - relayMillis > relayInterval) {
         relayMillis = currentMillis;
-        relayState = not(relayState);
+        // relayState = not(relayState);
         updateRelay();
     }
 
@@ -327,17 +407,25 @@ void loop() {
         tempMillis = currentMillis;
         getTemperature();
         if (tempOld != tempF && tempF > 0){
-            Serial.print("Temp in Celsius: ");
+            Serial.print(F("Temp in Celsius: "));
             Serial.print(tempC,2);
-            Serial.print("   Temp in Fahrenheit: ");
+            Serial.print(F("   Temp in Fahrenheit: "));
             Serial.println(tempF,2);
 
             display.setCursor(0,16);
             display.setTextSize(2);
-            display.print("int:");
+            display.print(F("int:"));
             display.print(tempF,2);
-            display.print("F");
+            display.print(F("F"));
             display.display();
+
+            if(tempF > temphigh){
+                tempalarm = 2; // set high alarm
+            } else if(tempF < templow){
+                tempalarm = 1; // set low alarm
+            } else {
+                tempalarm = 0; // reset alarm TODO only do this on control reset
+            }
 
             if(mqttClient.connected()) {
                 const size_t capacity = JSON_OBJECT_SIZE(2);
@@ -347,7 +435,12 @@ void loop() {
 
                 char buffer[256];
                 serializeJson(doc, buffer);
-                mqttClient.publish(topic_temp, buffer, true);
+                mqttClient.publish(topic_status_temp, buffer, true);
+                sprintf(buffer, "%3d", templow);
+                mqttClient.publish(topic_status_templow, buffer, true);
+                sprintf(buffer, "%3d", temphigh);
+                mqttClient.publish(topic_status_temphigh, buffer, true);
+                mqttClient.publish(topic_status_tempalarm, message_status_tempalarm[tempalarm], true);
             }
         }
     }
@@ -356,29 +449,29 @@ void loop() {
     // Listening for new clients
     WiFiClient client = server.available();
     if (client) {
-        Serial.println("New client");
+        Serial.println(F("New client"));
         // bolean to locate when the http request ends
         boolean blank_line = true;
         while (client.connected()) {
             if (client.available()) {
                 char c = client.read();
                 if (c == '\n' && blank_line) {
-                    client.println("HTTP/1.1 200 OK");
-                    client.println("Content-Type: text/html");
-                    client.println("Connection: close");
+                    client.println(F("HTTP/1.1 200 OK"));
+                    client.println(F("Content-Type: text/html"));
+                    client.println(F("Connection: close"));
                     client.println();
                     // web page that displays temperature
-                    client.println("<!DOCTYPE HTML><html><head></head><body><h1>");
+                    client.println(F("<!DOCTYPE HTML><html><head></head><body><h1>"));
                     client.println(ServerTitle);
-                    client.println("</h1><h3>Temperature in Celsius: ");
+                    client.println(F("</h1><h3>Temperature in Celsius: "));
                     client.println(tempC,2);
-                    client.println("*C</h3><h3>Temperature in Fahrenheit: ");
+                    client.println(F("*C</h3><h3>Temperature in Fahrenheit: "));
                     client.println(tempF,2);
-                    client.println("*F</h3><h3>Relay State: ");
+                    client.println(F("*F</h3><h3>Relay State: "));
                     client.println(relayState, BIN);
-                    client.println("</h3><h3>");
+                    client.println(F("</h3><h3>"));
                     client.println(stringTime);
-                    client.println("</h3></body></html>");
+                    client.println(F("</h3></body></html>"));
                     break;
                 }
                 if (c == '\n') {
@@ -394,7 +487,7 @@ void loop() {
         // closing the client connection
         delay(1);
         client.stop();
-        Serial.println("WebClient disconnected.");
+        Serial.println(F("WebClient disconnected."));
     }
 
 }
@@ -407,41 +500,40 @@ void loop() {
  */
 void initWifi() {
 	Serial.println("");
-	Serial.println("Connecting to: ");
-	Serial.print(ssid);
+	Serial.println(F("Connecting to: "));
+    Serial.print(ssid);
     display.setTextSize(1);
-    display.println("Connecting to: ");
+    display.println(F("Connecting to: "));
     display.println(ssid);
     display.display();
 
     WiFi.mode(WIFI_STA);
-	WiFi.begin(ssid, password);
+    WiFi.begin(ssid, password);
 
-	int timeout = 25 * 4; // 25 seconds
-	while(WiFi.status() != WL_CONNECTED  && (timeout-- > 0)) {
-		delay(250);
-		Serial.print(".");
-	}
-	Serial.println("");
+    int timeout = 25 * 4; // 25 seconds
+    while(WiFi.status() != WL_CONNECTED  && (timeout-- > 0)) {
+        delay(250);
+        Serial.print(".");
+    }
+    Serial.println("");
 
-	if(WiFi.status() != WL_CONNECTED) {
+    if(WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi failed.");
         display.println("Wifi failed.");
         display.display();
-	}
-	else {
-        Serial.println("Connected.");
-        Serial.print("IP: ");
+    }
+    else {
+        Serial.println(F("Connected."));
+        Serial.print(F("IP: "));
         Serial.println(WiFi.localIP());
-        display.println("Connected.");
-        display.print("IP: ");
+        display.println(F("Connected."));
+        display.print(F("IP: "));
         display.println(WiFi.localIP());
         display.display();
 
         // Starting the web server
         server.begin();
-        display.display();
-	}
+    }
 }
 
 
@@ -450,24 +542,27 @@ void initWifi() {
  */
 void initMQTT() {
     while (!mqttClient.connected() && ((currentMillis == 0) || (currentMillis - mqttMillis > mqttInterval))) {
-        Serial.print("Attempting MQTT connection...");
+        Serial.print(F("Attempting MQTT connection..."));
 
         // Attempt to connect
         if (mqttClient.connect(clientId.c_str(), clientId.c_str(), password,
                                willTopic, willQoS, willRetain, willMessage)) {
-            Serial.println("connected");
+            Serial.println(F("connected"));
             display.setTextSize(1);
-            display.println("MQTT connected.");
+            display.println(F("MQTT connected."));
             display.display();
             // Once connected, publish an announcement...
             mqttClient.publish(topic, ("connected " + clientId).c_str() , true );
-            mqttClient.subscribe(topic_control);
-            Serial.print("subscribed to : ");
-            Serial.println(topic_control);
+            mqttClient.subscribe(topic_control_relay);
+            mqttClient.subscribe(topic_control_relayon);
+            mqttClient.subscribe(topic_control_relayoff);
+            mqttClient.subscribe(topic_control_templow);
+            mqttClient.subscribe(topic_control_temphigh);
+            mqttClient.subscribe(topic_control_tempalarm);
         } else {
-            Serial.print("failed, rc=");
+            Serial.print(F("failed, rc="));
             Serial.print(mqttClient.state());
-            Serial.print(" wifi=");
+            Serial.print(F(" wifi="));
             Serial.println(WiFi.status());
             mqttMillis = currentMillis;
         }
@@ -491,10 +586,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.println();
 
     // Switch on the RELAY if an ON received
-    if (strcmp((char *)mypayload, (char *)control_message[0]) == 0) {
+    if (strcmp((char *)mypayload, (char *)message_control_relay[0]) == 0) {
         relayState = true;
         updateRelay();
-    } else if (strcmp((char *)mypayload, (char *)control_message[1]) == 0) {
+    } else if (strcmp((char *)mypayload, (char *)message_control_relay[1]) == 0) {
         relayState = false;
         updateRelay();
     }
@@ -505,18 +600,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
  * update Relay output
  */
 void updateRelay() {
-   digitalWrite(relay, !relayState); // reverse logic for relay
-   Serial.print("Relay: ");
-   Serial.print(monitor_message[!relayState]);
-   display.setTextSize(2);
-   display.setCursor(0,48);
-   display.print("relay:");
-   display.print(monitor_message[!relayState]);
-   display.print(" ");
-   display.display();
-   if(mqttClient.connected()) {
-       mqttClient.publish(topic_monitor, monitor_message[!relayState], true);
-   }
+    digitalWrite(relay, !relayState); // reverse logic for relay
+    Serial.print("Relay: ");
+    Serial.print(message_status_relay[!relayState]);
+    display.setTextSize(2);
+    display.setCursor(0,48);
+    display.print("relay:");
+    display.print(message_status_relay[!relayState]);
+    display.print(" ");
+    display.display();
+    if(mqttClient.connected()) {
+        mqttClient.publish(topic_status_relay, message_status_relay[!relayState], true);
+    }
 }
 
 
@@ -582,4 +677,22 @@ void sendNTPpacket(IPAddress &address)
   Udp.beginPacket(address, 123); //NTP requests are to port 123
   Udp.write(packetBuffer, NTP_PACKET_SIZE);
   Udp.endPacket();
+}
+
+void saveConfig() {
+    Serial.println(F("Saving config."));
+    File f = LittleFS.open("/Fishtank.cnf", "w+");
+    f.print(F("templow="));
+    f.println(templow);
+    f.print(F("temphigh="));
+    f.println(temphigh);
+    f.print(F("tempalarm="));
+    f.println(tempalarm);
+    f.print(F("relayon="));
+    f.println(relayon);
+    f.print(F("relayoff="));
+    f.println(relayoff);
+    f.flush();
+    f.close();
+    Serial.println(F("Saved values."));
 }
