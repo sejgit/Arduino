@@ -84,6 +84,7 @@ String ServerTitle = "Jenkins FishTank";
  */
 const char* topic = "sej"; //  main topic
 String clientId = "fishtank"; // client ID for this unit
+char buffer[256];
 
 // MQTT topics
 const char* topic_status_temp = "sej/fishtank/status/temp"; // temp reading topic
@@ -95,9 +96,9 @@ const char* message_status_tempalarm[] = {"OK", "LOW", "HIGH"};
 const char* topic_control_templow = "sej/fishtank/control/templow"; // temp  control low topic
 const char* topic_control_temphigh = "sej/fishtank/control/temphigh"; // temp  control high topic
 const char* topic_control_tempalarm = "sej/fishtank/control/tempalarm"; // temp control alarm topic
-const char* message_control_tempalarm[] = {"RESET"};
-int templow;
-int temphigh;
+const char* message_control_tempalarm[] = {"--", "RESET"};
+float templow;
+float temphigh;
 int tempalarm;
 
 const char* topic_status_relay = "sej/fishtank/status/relay"; // status relay state topic
@@ -137,6 +138,9 @@ DallasTemperature DS18B20(&oneWire);
 float tempC;
 float tempF;
 float tempOld;
+
+// cfg updates
+boolean cfgChangeFlag = false;
 
 
 /*
@@ -289,8 +293,8 @@ void setup() {
         //Will not create file; run save code to actually do so (no need here since
         //it's not changed)
         Serial.println(F("Failed to open config file"));
-        templow = 75;
-        temphigh = 88;
+        templow = 69.50;
+        temphigh = 79.50;
         tempalarm = 0;
         relayon = 0545;
         relayoff = 2045; // defaults
@@ -302,10 +306,10 @@ void setup() {
         Serial.println(key + F(" = [") + value + ']');
         Serial.println(key.length());
         if (key == F("templow")) {
-            templow = value.toInt();
+            templow = value.toFloat();
         }
         if (key == F("temphigh")) {
-            temphigh = value.toInt();
+            temphigh = value.toFloat();
         }
         if (key == F("tempalarm")) {
             tempalarm = value.toInt();
@@ -433,12 +437,11 @@ void loop() {
                 JsonObject obj = doc.createNestedObject("DS18B20");
                 obj["Temperature"] = tempF;
 
-                char buffer[256];
                 serializeJson(doc, buffer);
                 mqttClient.publish(topic_status_temp, buffer, true);
-                sprintf(buffer, "%3d", templow);
+                sprintf(buffer, "%3d.%02d", (int)templow, (int)(templow*100)%100);
                 mqttClient.publish(topic_status_templow, buffer, true);
-                sprintf(buffer, "%3d", temphigh);
+                sprintf(buffer, "%3d.%02d", (int)temphigh, (int)(temphigh*100)%100);
                 mqttClient.publish(topic_status_temphigh, buffer, true);
                 mqttClient.publish(topic_status_tempalarm, message_status_tempalarm[tempalarm], true);
             }
@@ -586,12 +589,89 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.println();
 
     // Switch on the RELAY if an ON received
-    if (strcmp((char *)mypayload, (char *)message_control_relay[0]) == 0) {
-        relayState = true;
-        updateRelay();
-    } else if (strcmp((char *)mypayload, (char *)message_control_relay[1]) == 0) {
-        relayState = false;
-        updateRelay();
+    if(strcmp(topic, topic_control_relay)==0){
+        if (strcmp((char *)mypayload, (char *)message_control_relay[0]) == 0) {
+            relayState = true;
+            updateRelay();
+        } else if (strcmp((char *)mypayload, (char *)message_control_relay[1]) == 0) {
+            relayState = false;
+            updateRelay();
+        }
+    }
+
+    // RELAY ON time received
+    if(strcmp(topic, topic_control_relayon)==0){
+        int hrtemp = atoi(mypayload) / 100;
+        int mintemp = atoi(mypayload) - (hrtemp * 100);
+        // convert to int then check if between 0000 & 2359 before setting relayon
+        if (hrtemp >= 0 && hrtemp <= 23) {
+            if (mintemp >= 0 && mintemp <= 59) {
+                cfgChangeFlag = true;
+                relayon = (hrtemp * 100) + mintemp;
+                sprintf(buffer, "%04d", relayon);
+                if(mqttClient.connected()) {
+                    mqttClient.publish(topic_status_relayon, buffer, true);
+                }
+            }
+        }
+    }
+
+    // RELAY OFF time received
+    if(strcmp(topic, topic_control_relayoff)==0){
+        int hrtemp = atoi(mypayload) / 100;
+        int mintemp = atoi(mypayload) - (hrtemp * 100);
+        // convert to int then check if between 0000 & 2359 before setting relayon
+        if (hrtemp >= 0 && hrtemp <= 23) {
+            if (mintemp >= 0 && mintemp <= 59) {
+                cfgChangeFlag = true;
+                relayoff = (hrtemp * 100) + mintemp;
+                sprintf(buffer, "%04d", relayoff);
+                if(mqttClient.connected()) {
+                    mqttClient.publish(topic_status_relayoff, buffer, true);
+                }
+            }
+        }
+    }
+
+    // temp low received
+    if(strcmp(topic, topic_control_templow)==0){
+        float temptemp = atof(mypayload);
+        // convert to float then check if between 40 & 150 before setting relayon
+        if (temptemp >= 40.00 && temptemp <= 150.00 && temptemp < temphigh) {
+            cfgChangeFlag = true;
+            templow = temptemp;
+            sprintf(buffer, "%3d.%02d", (int)templow, (int)(templow*100)%100);
+            if(mqttClient.connected()) {
+                mqttClient.publish(topic_status_templow, buffer, true);
+            }
+        }
+    }
+
+    // temp high received
+    if(strcmp(topic, topic_control_temphigh)==0){
+        float temptemp = atof(mypayload);
+        // convert to float then check if between 40 & 150 before setting relayon
+        if (temptemp >= 40.00 && temptemp <= 150.00 && temptemp > templow) {
+            cfgChangeFlag = true;
+            temphigh = temptemp;
+            sprintf(buffer, "%3d.%02d", (int)temphigh, (int)(temphigh*100)%100);
+            if(mqttClient.connected()) {
+                mqttClient.publish(topic_status_temphigh, buffer, true);
+            }
+        }
+    }
+
+    // temp alarm potential reset received
+    if(strcmp(topic, topic_control_tempalarm)==0){
+        // check if reset message
+        if (strcmp(mypayload, message_control_tempalarm[1]) == 0) {
+            cfgChangeFlag = true;
+            tempalarm = 0;
+            if(mqttClient.connected()) {
+                mqttClient.publish(topic_status_tempalarm, message_status_tempalarm[0], true);
+                mqttClient.publish(topic_control_tempalarm, message_control_tempalarm[0], true);
+            }
+        }
     }
 }
 
@@ -601,11 +681,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
  */
 void updateRelay() {
     digitalWrite(relay, !relayState); // reverse logic for relay
-    Serial.print("Relay: ");
+    Serial.print(F("Relay: "));
     Serial.print(message_status_relay[!relayState]);
     display.setTextSize(2);
     display.setCursor(0,48);
-    display.print("relay:");
+    display.print(F("relay:"));
     display.print(message_status_relay[!relayState]);
     display.print(" ");
     display.display();
