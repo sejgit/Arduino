@@ -179,24 +179,23 @@ int resetButton = D5 ;
 /*
  * Establish Wi-Fi connection & start web server
  */
-// TODO not right yet
-boolean initWifi(int tries = 2, int waitTime = 1) {
+boolean initWifi(int tries = 2, int waitTime = 2) {
     int status = WL_IDLE_STATUS;
     WiFi.mode(WIFI_STA);
 
-    int timeout = waitTime; // waitTime seconds
     while(status != WL_CONNECTED && (tries-- > 0)) {
         status = WiFi.begin(ssid, password);
+        int timeout = waitTime;
 
+        while (WiFi.status() != WL_CONNECTED && (timeout-- > 0)) {
+            delay(1000);
+        }
         if (WiFi.status() == WL_CONNECTED) {
             break;
         }
-        delay(waitTime * 1000);
     }
-    Serial.println("");
 
     if(WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi failed.");
         return false;
     }
     else {
@@ -210,25 +209,51 @@ boolean initWifi(int tries = 2, int waitTime = 1) {
 /*
  * MQTT client init connection
  */
-void initMQTT() {
-        Serial.print(F("Attempting MQTT connection..."));
+boolean initMQTT() {
+    Serial.print(F("Attempting MQTT connection..."));
 
-        // Attempt to connect
-        if (mqttClient.connect(clientId.c_str(), clientId.c_str(), password,
-                               willTopic, willQoS, willRetain, willMessage)) {
-            Serial.println(F("connected"));
-            display.setTextSize(1);
-            display.println(F("MQTT connected."));
-            display.display();
-            // Once connected, publish an announcement...
-            mqttClient.publish(topic, ("connected " + clientId).c_str() , true );
-            mqttClient.subscribe(topic_control_relay);
-            mqttClient.subscribe(topic_control_relayon);
-            mqttClient.subscribe(topic_control_relayoff);
-            mqttClient.subscribe(topic_control_templow);
-            mqttClient.subscribe(topic_control_temphigh);
-            mqttClient.subscribe(topic_control_tempalarm);
+    // Attempt to connect
+    if (mqttClient.connect(clientId.c_str(), clientId.c_str(), password,
+                           willTopic, willQoS, willRetain, willMessage)) {
+        Serial.println(F("connected"));
+        // Once connected, publish an announcement...
+        mqttClient.publish(topic, ("connected " + clientId).c_str() , true );
+        mqttClient.subscribe(topic_control_relay);
+        mqttClient.subscribe(topic_control_relayon);
+        mqttClient.subscribe(topic_control_relayoff);
+        mqttClient.subscribe(topic_control_templow);
+        mqttClient.subscribe(topic_control_temphigh);
+        mqttClient.subscribe(topic_control_tempalarm);
+        return true;
+    } else {
+        return false;
+    }
+}
+
+
+/*
+ * refresh config parameters to MQTT
+ */
+boolean mqttRefreshConfig() {
+    if(mqttClient.connected()) {
+        sprintf(buffer, "%3d.%02d", (int)tempLow, (int)(tempLow*100)%100);
+        mqttClient.publish(topic_status_templow, buffer, true);
+        sprintf(buffer, "%3d.%02d", (int)tempHigh, (int)(tempHigh*100)%100);
+        mqttClient.publish(topic_status_temphigh, buffer, true);
+        sprintf(buffer, "%04d", relayON);
+        mqttClient.publish(topic_status_relayon, buffer, true);
+        sprintf(buffer, "%04d", relayOFF);
+        mqttClient.publish(topic_status_relayoff, buffer, true);
+        if(tempF > tempHigh){
+            tempAlarm = 2; // set high alarm
+        } else if(tempF < tempLow){
+            tempAlarm = 1; // set low alarm
         }
+        mqttClient.publish(topic_status_tempalarm, message_status_tempalarm[tempAlarm], true);
+        return true;
+    } else {
+        return false;
+    }
 }
 
 
@@ -240,8 +265,8 @@ void updateRelay(boolean updateDisplay) {
     Serial.print(F("Relay: "));
     Serial.print(message_status_relay[!relayState]);
     if(updateDisplay){
-        display.setTextSize(2);
-        display.setCursor(0,48);
+        display.setTextSize(1);
+        display.setCursor(96,0);
         display.print(F("R:"));
         display.print(message_status_relay[!relayState]);
         display.print(" ");
@@ -651,7 +676,15 @@ void setup() {
     // MQTT
     mqttClient.setServer(mqtt_server, mqtt_serverport);
     mqttClient.setCallback(mqttCallback);
-    initMQTT();
+    if(initMQTT()) {
+        display.setTextSize(1);
+        display.println(F("MQTT connected."));
+        display.display();
+    } else {
+        display.setTextSize(1);
+        display.println(F("MQTT failed."));
+        display.display();
+    }
 
     // DS18B20
     Serial.println(F("DS18B20 Start."));
@@ -703,23 +736,7 @@ void setup() {
     }
     f.close();
 
-    // send initial parameters to MQTT
-    sprintf(buffer, "%3d.%02d", (int)tempLow, (int)(tempLow*100)%100);
-    mqttClient.publish(topic_status_templow, buffer, true);
-    sprintf(buffer, "%3d.%02d", (int)tempHigh, (int)(tempHigh*100)%100);
-    mqttClient.publish(topic_status_temphigh, buffer, true);
-    sprintf(buffer, "%04d", relayON);
-    mqttClient.publish(topic_status_relayon, buffer, true);
-    sprintf(buffer, "%04d", relayOFF);
-    mqttClient.publish(topic_status_relayoff, buffer, true);
-    if(tempF > tempHigh){
-        tempAlarm = 2; // set high alarm
-    } else if(tempF < tempLow){
-        tempAlarm = 1; // set low alarm
-    }
-    if(mqttClient.connected()) {
-        mqttClient.publish(topic_status_tempalarm, message_status_tempalarm[tempAlarm], true);
-    }
+    mqttRefreshConfig();
 
     // set relay once if time is in-between
     // from here on out will only be set on the minute
@@ -753,39 +770,40 @@ void loop() {
 
     currentMillis = millis();
 
-    // Init Wifi if dropped
+    // Wifi status & init if dropped
+    display.setTextColor(WHITE, BLACK);
+    display.setTextSize(1);
+    display.setCursor(0,56);
+    display.print("W:");
     if(WiFi.status() != WL_CONNECTED) {
-        display.setTextColor(WHITE, BLACK);
-        display.setCursor(56,48);
-        display.setTextSize(2);
-        display.print("W:");
+        Serial.println(F("Reconnecting WiFi."));
         display.print(message_status_server[0]);
         display.display();
-        Serial.println(F("Reconnecting WiFi."));
-        initWifi();
-    } else {
-        display.setTextColor(WHITE, BLACK);
-        display.setCursor(56,48);
-        display.setTextSize(2);
-        display.print("W:");
-        display.print(message_status_server[1]);
-        display.display();
+        if(initWifi()) {
+            Serial.println(F("WiFi connected."));
+        }
+        } else {
+            display.print(message_status_server[1]);
+            display.display();
 
-    // Init MQTT if dropped
-    if(mqttClient.connected()) {
-    mqttClient.loop();
-    } else {
-    display.clearDisplay();
-        display.setTextColor(WHITE, BLACK);
-        display.setCursor(0,0);
-        display.setTextSize(1);
-        Serial.println(F("Reconnecting MQTT."));
-        display.println(F("Reconnecting MQTT."));
-        display.display();
-        initMQTT();
-        display.clearDisplay();
-    }
-    }
+            // MQTT status & init if dropped
+            display.setCursor(96,56);
+            display.print("M:");
+            if(!mqttClient.connected()) {
+                Serial.println(F("Reconnecting MQTT."));
+                display.print(message_status_server[0]);
+                display.display();
+                if(initMQTT()) {
+                    if(mqttRefreshConfig()) {
+                        Serial.println(F("MQTT connected."));
+                    }
+                }
+            } else {
+                mqttClient.loop();
+                display.print(message_status_server[1]);
+                display.display();
+            }
+        }
 
     // local led hb
     if(currentMillis - ledMillis > ledInterval) {
@@ -852,7 +870,7 @@ void loop() {
 
     // update the config file if required
     if(cfgChangeFlag) {
-        saveConfig();
-        cfgChangeFlag = false;
-    }
+            saveConfig();
+            cfgChangeFlag = false;
+        }
 }
