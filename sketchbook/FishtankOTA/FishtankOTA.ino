@@ -141,6 +141,7 @@ DallasTemperature DS18B20(&oneWire);
 float tempC;
 float tempF;
 float tempOld;
+int tempAlarmOld;
 
 // cfg updates
 boolean cfgChangeFlag = false;
@@ -152,17 +153,17 @@ boolean cfgChangeFlag = false;
 unsigned long currentMillis = 0;
 unsigned long tempMillis = 0;
 const long tempInterval = 30000; // minimum 10s for DS18B20
-unsigned long mqttMillis = 0;
-const long mqttInterval = 30000;
+unsigned long tempAlarmMillis = 0;
+const long tempAlarmInterval = 30000; // allow reset for this time
 unsigned long hbMillis = 0;
-const long hbInterval = 60000;
+const long hbInterval = 60000; // how often to send hb
 unsigned long ledMillis = 0;
-const long ledInterval = 3000;
+const long ledInterval = 3000; // blink led h
 bool ledState = false;
 unsigned long relayMillis = 0;
-const long relayInterval = 30000;
-bool relayState = false;
-
+const long relayInterval = 30000; // update relay at least this often
+boolean relayState;
+boolean relayStateOld;
 
 /*
  * IO
@@ -244,11 +245,6 @@ boolean mqttRefreshConfig() {
         mqttClient.publish(topic_status_relayon, buffer, true);
         sprintf(buffer, "%04d", relayOFF);
         mqttClient.publish(topic_status_relayoff, buffer, true);
-        if(tempF > tempHigh){
-            tempAlarm = 2; // set high alarm
-        } else if(tempF < tempLow){
-            tempAlarm = 1; // set low alarm
-        }
         mqttClient.publish(topic_status_tempalarm, message_status_tempalarm[tempAlarm], true);
         return true;
     } else {
@@ -260,21 +256,50 @@ boolean mqttRefreshConfig() {
 /*
  * update Relay output
  */
-void updateRelay(boolean updateDisplay) {
-    digitalWrite(relay, !relayState); // reverse logic for relay
-    Serial.print(F("Relay: "));
-    Serial.print(message_status_relay[!relayState]);
-    if(updateDisplay){
-        display.setTextSize(1);
-        display.setCursor(96,0);
-        display.print(F("R:"));
-        display.print(message_status_relay[!relayState]);
-        display.print(" ");
-        display.display();
+boolean updateRelay(boolean switchrange) {
+    // if switchrange true then turn on if between RelayON/OFF
+    // if false then switch on the minute only
+    if(switchrange) {
+        if ((relayON <= (hour(local) * 100 + minute(local)))
+            && (relayOFF >= (hour(local) * 100 + minute(local)))) {
+            relayState = true;
+        } else {
+            relayState = false;
+        }
+    } else {
+        if (relayON == (hour(local) * 100 + minute(local))){
+            relayState = true;
+        }
+        if (relayOFF == (hour(local) * 100 + minute(local))){
+            relayState = false;
+        }
     }
-    if(mqttClient.connected()) {
-        mqttClient.publish(topic_status_relay, message_status_relay[!relayState], true);
+    if(relayState != relayStateOld || switchrange) {
+        digitalWrite(relay, !relayState); // reverse logic for relay
+        Serial.print(F("Relay: "));
+        Serial.println(message_status_relay[!relayState]);
+        relayStateOld = relayState;
+        return true;
     }
+    return false;
+}
+
+
+/*
+ * updateLocalTime
+ */
+boolean updateLocalTime() {
+    if(timeStatus() == timeSet) {
+        if(oldmin != minute()) {
+            local = myTZ.toLocal(now(), &tcr);
+            sprintf(stringTime, "%02d:%02d", hour(local), minute(local));
+            oldmin = minute();
+            return true;
+        }
+    } else {
+        sprintf(stringTime, "%s", defaultTime);
+    }
+    return false;
 }
 
 
@@ -297,10 +322,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     if(strcmp(topic, topic_control_relay)==0){
         if (strcmp((char *)mypayload, (char *)message_control_relay[0]) == 0) {
             relayState = true;
-            updateRelay(true);
         } else if (strcmp((char *)mypayload, (char *)message_control_relay[1]) == 0) {
             relayState = false;
-            updateRelay(true);
         }
     }
 
@@ -317,6 +340,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
                 if(mqttClient.connected()) {
                     mqttClient.publish(topic_status_relayon, buffer, true);
                 }
+                updateRelay(true); // switchrange=switch on range
             }
         }
     }
@@ -334,6 +358,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
                 if(mqttClient.connected()) {
                     mqttClient.publish(topic_status_relayoff, buffer, true);
                 }
+                updateRelay(true); // switchrange=switch on range
             }
         }
     }
@@ -372,7 +397,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         if (strcmp(mypayload, message_control_tempalarm[1]) == 0) {
             cfgChangeFlag = true;
             tempAlarm = 0;
-            tempMillis = 0;
+            tempAlarmMillis = currentMillis;
             if(mqttClient.connected()) {
                 mqttClient.publish(topic_status_tempalarm, message_status_tempalarm[0], true);
                 mqttClient.publish(topic_control_tempalarm, message_control_tempalarm[0], true);
@@ -383,15 +408,47 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
 
 /*
- * GetTemperature from DS18B20
+ * GetTemperature from DS18B20 return true if changed
  */
-void getTemperature() {
-	do {
-		DS18B20.requestTemperatures();
-		tempC = DS18B20.getTempCByIndex(0);
-		tempF = DS18B20.getTempFByIndex(0);
-		delay(100);
-	} while (tempC == 85.0 || tempC == (-127.0));
+boolean getTemperature() {
+    // sensor can only handle being checked so often max every 10s
+    if(currentMillis - tempMillis > tempInterval) {
+        tempMillis = currentMillis;
+    do {
+        DS18B20.requestTemperatures();
+        tempC = DS18B20.getTempCByIndex(0);
+        tempF = DS18B20.getTempFByIndex(0);
+        delay(100);
+    } while (tempC == 85.0 || tempC == (-127.0));
+    }
+
+    if(tempF != tempOld && tempF > 0) {
+        tempOld = tempF;
+        return true; // return true if temp changed
+    }
+    return false;
+}
+
+
+/*
+ * update Temperature alarms return true if changed
+ */
+boolean updateTemperatureAlarm() {
+    if(currentMillis - tempAlarmMillis > tempAlarmInterval) {
+    if(tempF > tempHigh){
+    tempAlarm = 2; // set high alarm
+    } else if(tempF < tempLow && tempF > 0){
+    tempAlarm = 1; // set low alarm
+    }
+    }
+    if (tempAlarm != tempAlarmOld) {
+        if(mqttClient.connected()) {
+            mqttClient.publish(topic_status_tempalarm, message_status_tempalarm[tempAlarm], true);
+            tempAlarmOld = tempAlarm;
+        }
+        return true; //return true if alarm changed
+    }
+    return false;
 }
 
 
@@ -454,20 +511,24 @@ void sendNTPpacket(IPAddress &address)
  */
 void saveConfig() {
     Serial.println(F("Saving config."));
-    File f = LittleFS.open("/Fishtank.cnf", "w+");
-    f.print(F("tempLow="));
-    f.println(tempLow);
-    f.print(F("tempHigh="));
-    f.println(tempHigh);
-    f.print(F("tempAlarm="));
-    f.println(tempAlarm);
-    f.print(F("relayON="));
-    f.println(relayON);
-    f.print(F("relayOFF="));
-    f.println(relayOFF);
-    f.flush();
-    f.close();
-    Serial.println(F("Saved values."));
+    File f = LittleFS.open("/fishtank.cnf", "w");
+    if(!f){
+        Serial.println(F("Write failed."));
+    } else {
+        f.print(F("tempLow="));
+        f.println(tempLow);
+        f.print(F("tempHigh="));
+        f.println(tempHigh);
+        f.print(F("tempAlarm="));
+        f.println(tempAlarm);
+        f.print(F("relayON="));
+        f.println(relayON);
+        f.print(F("relayOFF="));
+        f.println(relayOFF);
+        f.flush();
+        f.close();
+        Serial.println(F("Saved values."));
+    }
 }
 
 
@@ -521,41 +582,6 @@ void webClient() {
 
 
 /*
- * updateLocalTimeRelay
- */
-void updateLocalTimeRelay(boolean updateDisplay) {
-    if(timeStatus() == timeSet) {
-        local = myTZ.toLocal(now(), &tcr);
-        sprintf(stringTime, "%02d:%02d", hour(local), minute(local));
-        if(oldmin != minute()){
-            oldmin = minute();
-            if(updateDisplay) {
-                display.setTextSize(2);
-                display.setCursor(0,0);
-                display.print(stringTime);
-                display.display();
-            }
-        }
-        // relay control
-        if(currentMillis - relayMillis > relayInterval) {
-            relayMillis = currentMillis;
-            updateRelay(updateDisplay);
-        }
-        if (relayON == (hour(local) * 100 + minute(local))){
-            relayState = true;
-            updateRelay(updateDisplay);
-        }
-        if (relayOFF == (hour(local) * 100 + minute(local))){
-            relayState = false;
-            updateRelay(updateDisplay);
-        }
-    } else {
-        sprintf(stringTime, "%s", defaultTime);
-    }
-}
-
-
-/*
  * Setup
  */
 void setup() {
@@ -573,7 +599,8 @@ void setup() {
     // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
     if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x64
         Serial.println(F("SSD1306 allocation failed"));
-        for(;;); // Don't proceed, loop forever
+        delay(5000);
+        ESP.restart();
     }
 
     // Show initial display buffer contents on the screen --
@@ -672,6 +699,8 @@ void setup() {
     Udp.begin(localPort);
     setSyncProvider(getNtpTime);
     setSyncInterval(300);
+    updateLocalTime();
+    oldmin = 99;
 
     // MQTT
     mqttClient.setServer(mqtt_server, mqtt_serverport);
@@ -692,15 +721,15 @@ void setup() {
     display.display();
     DS18B20.begin();
     getTemperature();
-    tempOld = 0;
+    tempOld = -1;
+    tempAlarmOld = -1;
 
     // LittleFS
     LittleFSConfig cfg;
-    cfg.setAutoFormat(false);
     LittleFS.setConfig(cfg);
     LittleFS.begin();
     Serial.println(F("Loading config"));
-    File f = LittleFS.open("/Fishtank.cnf", "r");
+    File f = LittleFS.open("/fishtank.cnf", "r");
     if (!f) {
         //File does not exist -- first run or someone called format()
         //Will not create file; run save code to actually do so (no need here since
@@ -711,28 +740,29 @@ void setup() {
         tempAlarm = 0;
         relayON = 0545;
         relayOFF = 2045; // defaults
-    }
-    while (f.available()) {
-        String key = f.readStringUntil('=');
-        String value = f.readStringUntil('\r');
-        f.read();
-        Serial.println(key + F(" = [") + value + ']');
-        Serial.println(key.length());
-        if (key == F("tempLow")) {
-            tempLow = value.toFloat();
+    } else {
+        while(f.available()){
+            String key = f.readStringUntil('=');
+            String value = f.readStringUntil('\n');
+            Serial.println(key + F(" = [") + value + ']');
+            Serial.println(key.length());
+            if (key == F("tempLow")) {
+                tempLow = value.toFloat();
+            }
+            if (key == F("tempHigh")) {
+                tempHigh = value.toFloat();
+            }
+            if (key == F("tempAlarm")) {
+                tempAlarm = value.toInt();
+            }
+            if (key == F("relayON")) {
+                relayON = value.toInt();
+            }
+            if (key == F("relayOFF")) {
+                relayOFF = value.toInt();
+            }
         }
-        if (key == F("tempHigh")) {
-            tempHigh = value.toFloat();
-        }
-        if (key == F("tempAlarm")) {
-            tempAlarm = value.toInt();
-        }
-        if (key == F("relayON")) {
-            relayON = value.toInt();
-        }
-        if (key == F("relayOFF")) {
-            relayOFF = value.toInt();
-        }
+        display.println(F("Config file"));
     }
     f.close();
 
@@ -741,17 +771,11 @@ void setup() {
     // set relay once if time is in-between
     // from here on out will only be set on the minute
     // to allow for manual control
-    // update display = false
-    updateLocalTimeRelay(false);
-    if(timeStatus() == timeSet) {
-        if ((relayON <= (hour(local) * 100 + minute(local)))
-            && (relayOFF >= (hour(local) * 100 + minute(local)))) {
-            relayState = true;
-        } else {
-            relayState = false;
-        }
-        updateRelay(false);
-    }
+    updateRelay(true); // switchrange=switch on range
+    relayStateOld = !relayState;
+
+    // allow alarm to fire immediately if need be
+    tempAlarmMillis = 0;
 
     // clean-up
     Serial.println(F("Boot complete."));
@@ -761,6 +785,8 @@ void setup() {
     display.clearDisplay();
 }
 
+// TODO add external temp & humidity
+// TODO level sensor
 
 /*
  * loop
@@ -792,6 +818,7 @@ void loop() {
             if(!mqttClient.connected()) {
                 Serial.println(F("Reconnecting MQTT."));
                 display.print(message_status_server[0]);
+                display.print(" ");
                 display.display();
                 if(initMQTT()) {
                     if(mqttRefreshConfig()) {
@@ -801,6 +828,7 @@ void loop() {
             } else {
                 mqttClient.loop();
                 display.print(message_status_server[1]);
+                display.print(" ");
                 display.display();
             }
         }
@@ -821,56 +849,83 @@ void loop() {
         }
     }
 
-    // update Local Time & Relay
-    updateLocalTimeRelay(true);
-
-    // Temperature retrieve & publish
-    if(currentMillis - tempMillis > tempInterval) {
-        tempMillis = currentMillis;
-        getTemperature();
-        if (tempOld != tempF && tempF > 0){
-            Serial.print(F("Temp in Celsius: "));
-            Serial.print(tempC,2);
-            Serial.print(F("   Temp in Fahrenheit: "));
-            Serial.println(tempF,2);
-
-            display.setCursor(0,16);
-            display.setTextSize(2);
-            display.print(message_status_tempalarm[tempAlarm]);
-            display.print(F(":"));
-            display.print(tempF,2);
-            display.print(F("F"));
+    // update Local Time
+    if(updateLocalTime()){
+        display.setTextSize(2);
+        display.setCursor(0,0);
+            display.print(stringTime);
             display.display();
+    }
 
-            if(mqttClient.connected()) {
-                const size_t capacity = JSON_OBJECT_SIZE(2);
-                StaticJsonDocument<capacity> doc;
-                JsonObject obj = doc.createNestedObject("DS18B20");
-                obj["Temperature"] = tempF;
-                serializeJson(doc, buffer);
-                mqttClient.publish(topic_status_temp, buffer, true);
+    // relay update at least every relayInterval & if changed
+    if(updateRelay(false) || (currentMillis - relayMillis > relayInterval)){
+        relayMillis = currentMillis;
+        display.setTextSize(1);
+        display.setCursor(96,0);
+        display.print(F("R:"));
+        display.print(message_status_relay[!relayState]);
+        if(relayState) {
+            display.print(" ");
             }
-        }
-        if(tempF > tempHigh){
-            tempAlarm = 2; // set high alarm
-            if(mqttClient.connected()) {
-                mqttClient.publish(topic_status_tempalarm, message_status_tempalarm[tempAlarm], true);
-            }
-        } else if(tempF < tempLow){
-            tempAlarm = 1; // set low alarm
-            if(mqttClient.connected()) {
-                mqttClient.publish(topic_status_tempalarm, message_status_tempalarm[tempAlarm], true);
-            }
+        display.display();
+        if(mqttClient.connected()) {
+            mqttClient.publish(topic_status_relay, message_status_relay[!relayState], true);
         }
     }
 
-    // Web Client
-    // Listening for new clients & serve them
+    // Temperature retrieve & publish
+    if (getTemperature() || updateTemperatureAlarm()) {
+        if(mqttClient.connected()) {
+            const size_t capacity = JSON_OBJECT_SIZE(2);
+            StaticJsonDocument<capacity> doc;
+            JsonObject obj = doc.createNestedObject("DS18B20");
+            obj["Temperature"] = tempF;
+            serializeJson(doc, buffer);
+            mqttClient.publish(topic_status_temp, buffer, true);
+        }
+        Serial.print(F("Temp in Celsius: "));
+        Serial.print(tempC,2);
+        Serial.print(F("   Temp in Fahrenheit: "));
+        Serial.println(tempF,2);
+        Serial.print(F("Alarm: "));
+        Serial.println(message_status_tempalarm[tempAlarm]);
+
+        display.setCursor(0,16);
+        display.setTextSize(2);
+        display.print(message_status_tempalarm[tempAlarm]);
+        display.print(F(":"));
+        if(tempF > tempHigh || tempF < tempLow) {
+            display.setTextColor(BLACK, WHITE); // reverse if currently out of spec
+        }
+        if(tempF == 0.00) {
+            display.print(F("--.--"));
+        } else {
+            display.print(tempF,2);
+        }
+        display.print(F("F"));
+        display.setTextColor(WHITE, BLACK);
+        display.display();
+    }
+
+    // Temperature manual reset
+    if(!digitalRead(resetButton) && tempAlarm > 0){
+        Serial.println(F("Reset Alarm Button"));
+        cfgChangeFlag = true;
+        tempAlarm = 0;
+        tempAlarmMillis = currentMillis;
+        if(mqttClient.connected()) {
+            mqttClient.publish(topic_status_tempalarm, message_status_tempalarm[0], true);
+            mqttClient.publish(topic_control_tempalarm, message_control_tempalarm[0], true);
+        }
+    }
+
+// Web Client
+// Listening for new clients & serve them
     webClient();
 
-    // update the config file if required
+// update the config file if required
     if(cfgChangeFlag) {
-            saveConfig();
-            cfgChangeFlag = false;
-        }
+        saveConfig();
+        cfgChangeFlag = false;
+    }
 }
