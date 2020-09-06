@@ -4,8 +4,8 @@
  *  Written for an ESP8266 ESP-12E
  *  --fqbn esp8266:8266:nodemcuv2
  *
- *  update SeJ 08/22/2020 SeJ init
- *
+ *  08/22/2020 SeJ init
+ *  09/06/2020 SeJ V1.0
  */
 
 
@@ -117,9 +117,9 @@ const char* topic_control_relayoff = "sej/fishtank/control/relayoff"; // control
 int relayON;
 int relayOFF;
 
-const char* topic_status_level = "sej/fishtank/status/level"; // water level topic
-const char* message_status_level[] = {"OK", "LO"};
-boolean levelStatus;
+const char* topic_status_lowlevel = "sej/fishtank/status/lowlevel"; // water low level topic
+const char* message_status_lowlevel[] = {"ON", "OFF"};
+boolean lowLevelStatus;
 
 const char* topic_status_hb = "sej/fishtank/status/hb"; // hb topic
 const char* message_status_hb[] = {"ON", "OFF"};
@@ -213,7 +213,7 @@ int relay = D0; // power relay
 // DHT-22 sensor data wire is pin D3 on the ESP8266 12-E - GPIO 15
 // LED_BUILTIN is D4 on ESP-12E
 int resetButton = D5; // pb to ground
-int levelSensor = D6; // water level sensor to ground
+int lowLevelSensor = D6; // low water level sensor to ground
 // DS18B20 sensor data wire is pin D7 on the ESP8266 12-E - GPIO 13
 
 
@@ -661,8 +661,8 @@ void setup() {
     pinMode(relay, OUTPUT);
     digitalWrite(relay, !relayState); // reverse logic for relay
     pinMode(resetButton, INPUT_PULLUP); // tempAlarm reset
-    pinMode(levelSensor, INPUT_PULLUP); // water level sensor
-    levelStatus = !digitalRead(levelSensor); // set to opposite so to display later
+    pinMode(lowLevelSensor, INPUT_PULLUP); // low water level sensor
+    lowLevelStatus = !digitalRead(lowLevelSensor); // set to opposite so to display later
 
 
     Serial.begin(9600);
@@ -883,41 +883,38 @@ void loop() {
     display.print("W:");
     if(WiFi.status() != WL_CONNECTED) {
         Serial.println(F("Reconnecting WiFi."));
+        display.setTextColor(BLACK, WHITE); // reverse if currently out of spec
         display.print(message_status_server[0]);
+        display.setTextColor(WHITE, BLACK); // back to normal
         display.display();
         if(initWifi()) {
             Serial.println(F("WiFi connected."));
         }
-        } else {
-            display.print(message_status_server[1]);
+    } else {
+        display.print(message_status_server[1]);
+        display.display();
+
+        // MQTT status & init if dropped
+        display.setCursor(48,56);
+        display.print("M:");
+        if(!mqttClient.connected()) {
+            Serial.println(F("Reconnecting MQTT."));
+            display.setTextColor(BLACK, WHITE); // reverse if currently out of spec
+            display.print(message_status_server[0]);
+            display.setTextColor(WHITE, BLACK); // back to normal
+            display.print(" ");
             display.display();
-
-            // MQTT status & init if dropped
-            display.setCursor(48,56);
-            display.print("M:");
-            if(!mqttClient.connected()) {
-                Serial.println(F("Reconnecting MQTT."));
-                display.print(message_status_server[0]);
-                display.print(" ");
-                display.display();
-                if(initMQTT()) {
-                    if(mqttRefreshConfig()) {
-                        Serial.println(F("MQTT connected."));
-                    }
+            if(initMQTT()) {
+                if(mqttRefreshConfig()) {
+                    Serial.println(F("MQTT connected."));
                 }
-            } else {
-                mqttClient.loop();
-                display.print(message_status_server[1]);
-                display.print(" ");
-                display.display();
             }
+        } else {
+            mqttClient.loop();
+            display.print(message_status_server[1]);
+            display.print(" ");
+            display.display();
         }
-
-    // local led hb
-    if(currentMillis - ledMillis > ledInterval) {
-        ledMillis = currentMillis;
-        ledState = not(ledState);
-        digitalWrite(LED_BUILTIN, ledState);
     }
 
     // MQTT Heartbeat
@@ -972,7 +969,11 @@ void loop() {
 
         display.setCursor(0,17);
         display.setTextSize(2);
+        if(tempAlarm != 0) {
+            display.setTextColor(BLACK, WHITE); // reverse if currently out of spec
+        }
         display.print(message_status_tempalarm[tempAlarm]);
+        display.setTextColor(WHITE, BLACK); // back to normal
         display.print(F(":"));
         if(tempF > tempHigh || tempF < tempLow) {
             display.setTextColor(BLACK, WHITE); // reverse if currently out of spec
@@ -983,7 +984,7 @@ void loop() {
             display.print(tempF,2);
         }
         display.print(F("F"));
-        display.setTextColor(WHITE, BLACK);
+        display.setTextColor(WHITE, BLACK); // back to normal
         display.display();
     }
 
@@ -1031,22 +1032,6 @@ void loop() {
         display.display();
     }
 
-    // Water level sensor
-    if(digitalRead(levelSensor) != levelStatus){
-        levelStatus = digitalRead(levelSensor);
-        Serial.print(F("Level: "));
-        Serial.print(message_status_level[levelStatus]);
-        display.setCursor(96,56);
-        display.setTextSize(1);
-        display.print(F("L:"));
-        display.print(message_status_level[levelStatus]);
-        display.display();
-
-        if(mqttClient.connected()) {
-            mqttClient.publish(topic_status_level, message_status_level[levelStatus], true);
-        }
-    }
-
     // Temperature manual reset
     if(!digitalRead(resetButton) && tempAlarm > 0){
         Serial.println(F("Reset Alarm Button"));
@@ -1057,6 +1042,39 @@ void loop() {
             mqttClient.publish(topic_status_tempalarm, message_status_tempalarm[0], true);
             mqttClient.publish(topic_control_tempalarm, message_control_tempalarm[0], true);
         }
+    }
+
+    // Low water level sensor
+    if(digitalRead(lowLevelSensor) != lowLevelStatus){
+        lowLevelStatus = digitalRead(lowLevelSensor);
+        display.setCursor(96,56);
+        display.setTextSize(1);
+        display.print(F("L:"));
+        if(lowLevelStatus){
+            Serial.print(F("Water Normal Level."));
+            display.print(F("OK"));
+        } else {
+            Serial.print(F("Water Low Level."));
+            display.setTextColor(BLACK, WHITE); // reverse if currently out of spec
+            display.print(F("LO"));
+            display.setTextColor(WHITE, BLACK); // back to normal
+        }
+        display.display();
+        if(mqttClient.connected()) {
+            mqttClient.publish(topic_status_lowlevel, message_status_lowlevel[lowLevelStatus], true);
+        }
+    }
+
+    // flash local led hb if any non-standard condition otherwise off
+    if(WiFi.status() != WL_CONNECTED || !mqttClient.connected() || tempAlarm > 0 ||
+       tempF > tempHigh || tempF < tempLow || !lowLevelStatus) {
+        ledState = not(ledState);
+    } else {
+        ledState = false;
+    }
+    if(currentMillis - ledMillis > ledInterval) {
+        ledMillis = currentMillis;
+        digitalWrite(LED_BUILTIN, !ledState);
     }
 
 // Web Client
