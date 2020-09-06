@@ -25,6 +25,7 @@
 #include <TimeLib.h>
 #include <Timezone.h>
 #include <LittleFS.h>
+#include <DHT.h>
 
 
 /* Passwords & Ports
@@ -94,6 +95,8 @@ const char* topic_status_temphigh = "sej/fishtank/status/temphigh"; // temp stat
 const char* topic_status_tempalarm = "sej/fishtank/status/tempalarm"; // temp status alarm topic
 const char* message_status_tempalarm[] = {"OK", "LO", "HI"};
 
+const char* topic_status_exttemp = "sej/fishtank/status/exttemp"; // extTemp reading topic
+
 const char* topic_control_templow = "sej/fishtank/control/templow"; // temp  control low topic
 const char* topic_control_temphigh = "sej/fishtank/control/temphigh"; // temp  control high topic
 const char* topic_control_tempalarm = "sej/fishtank/control/tempalarm"; // temp control alarm topic
@@ -114,6 +117,10 @@ const char* topic_control_relayoff = "sej/fishtank/control/relayoff"; // control
 int relayON;
 int relayOFF;
 
+const char* topic_status_level = "sej/fishtank/status/level"; // water level topic
+const char* message_status_level[] = {"OK", "LO"};
+boolean levelStatus;
+
 const char* topic_status_hb = "sej/fishtank/status/hb"; // hb topic
 const char* message_status_hb[] = {"ON", "OFF"};
 
@@ -123,14 +130,20 @@ const char* willTopic = topic; // will topic
 byte willQoS = 0;
 boolean willRetain = false;
 const char* willMessage = ("lost connection " + clientId).c_str();
-bool heartbeat = false; // heartbeat to mqtt
+boolean heartbeat = false; // heartbeat to mqtt
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 long mqttLastMsg = 0;
 int mqttValue = 0;
 
-// Data wire is plugged into pin D7 on the ESP8266 12-E - GPIO 13
+
+/*
+ * temperature / humidity sensors
+ */
+
+// DS18B20 one-wire for in-tank temperature
+// Data wire is pin D7 on the ESP8266 12-E - GPIO 13
 #define ONE_WIRE_BUS 13
 
 // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
@@ -142,6 +155,28 @@ float tempC;
 float tempF;
 float tempOld;
 int tempAlarmOld;
+
+// DHT-22 sensor for external temp/humidity
+// Data wire is pin D8 on the ESP8266 12-E - GPIO 15
+#define DHTTYPE DHT22 // DHT 22 (AM2302), AM321
+uint8_t DHTPin = D3;
+// Connect pin 1 (on the left) of the sensor to +5V
+// NOTE: If using a board with 3.3V logic like an Arduino Due connect pin 1
+// to 3.3V instead of 5V!
+// Connect pin 2 of the sensor to whatever your DHTPIN is
+// Connect pin 4 (on the right) of the sensor to GROUND
+// Connect a 10K resistor from pin 2 (data) to pin 1 (power) of the sensor
+
+// Initialize DHT sensor
+DHT dht(DHTPin, DHTTYPE);
+
+// Reading temperature or humidity takes about 250 milliseconds!
+// Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
+float extHum; //  h = dht.readHumidity();
+float extTempC; // t = dht.readTemperature(); // Read temperature as Celsius (the default)
+float extTempF; // f = dht.readTemperature(true); // Read temperature as Fahrenheit (isFahrenheit = true)
+float extTempOld;
+float extHumOld;
 
 // cfg updates
 boolean cfgChangeFlag = false;
@@ -155,6 +190,8 @@ unsigned long tempMillis = 0;
 const long tempInterval = 30000; // minimum 10s for DS18B20
 unsigned long tempAlarmMillis = 0;
 const long tempAlarmInterval = 30000; // allow reset for this time
+unsigned long extTempHumMillis = 0;
+const long extTempHumInterval = 30000; // minimum 2s for DHT-22
 unsigned long hbMillis = 0;
 const long hbInterval = 60000; // how often to send hb
 unsigned long ledMillis = 0;
@@ -165,12 +202,19 @@ const long relayInterval = 30000; // update relay at least this often
 boolean relayState;
 boolean relayStateOld;
 
+
 /*
  * IO
  */
-// LED_BUILTIN is D0 on ESP-12E
-int relay = D6; // power relay
-int resetButton = D5 ;
+int relay = D0; // power relay
+// I2C SCL is D1
+// I2C SCA is D2
+// Display is 0x3C I2C device
+// DHT-22 sensor data wire is pin D3 on the ESP8266 12-E - GPIO 15
+// LED_BUILTIN is D4 on ESP-12E
+int resetButton = D5; // pb to ground
+int levelSensor = D6; // water level sensor to ground
+// DS18B20 sensor data wire is pin D7 on the ESP8266 12-E - GPIO 13
 
 
 /*
@@ -296,8 +340,6 @@ boolean updateLocalTime() {
             oldmin = minute();
             return true;
         }
-    } else {
-        sprintf(stringTime, "%s", defaultTime);
     }
     return false;
 }
@@ -404,6 +446,33 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
             }
         }
     }
+}
+
+
+/*
+ * GetExtTempHum from DHT-22 return true if changed
+ */
+boolean getExtTempHum() {
+    // sensor can only handle being checked so often max every 2s
+    if(currentMillis - extTempHumMillis > extTempHumInterval) {
+        extTempHumMillis = currentMillis;
+        // Reading temperature or humidity takes about 250 milliseconds!
+        // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
+        extHum = dht.readHumidity();
+        extTempC = dht.readTemperature(); // Read temperature as Celsius (the default)
+        extTempF = dht.readTemperature(true); // Read temperature as Fahrenheit (isFahrenheit = true)
+    }
+
+    if(extTempF != extTempOld || extHum != extHumOld) {
+        if(extTempF != extTempOld){
+            extTempOld = extTempF;
+        }
+        if(extHum != extHumOld){
+            extHumOld = extHum;
+        }
+        return true; // return true if temp or hum changed
+    }
+    return false;
 }
 
 
@@ -587,10 +656,13 @@ void webClient() {
 void setup() {
     Serial.println(F("Boot Start."));
 
+    // Set-up I/O
     pinMode(LED_BUILTIN, OUTPUT);
     pinMode(relay, OUTPUT);
     digitalWrite(relay, !relayState); // reverse logic for relay
     pinMode(resetButton, INPUT_PULLUP); // tempAlarm reset
+    pinMode(levelSensor, INPUT_PULLUP); // water level sensor
+    levelStatus = !digitalRead(levelSensor); // set to opposite so to display later
 
 
     Serial.begin(9600);
@@ -699,7 +771,12 @@ void setup() {
     Udp.begin(localPort);
     setSyncProvider(getNtpTime);
     setSyncInterval(300);
-    updateLocalTime();
+    if(!updateLocalTime()){
+        Serial.println(F("Time update failed"));
+        display.println(F("Time update failed"));
+        display.display();
+        sprintf(stringTime, "%s", defaultTime);
+    }
     oldmin = 99;
 
     // MQTT
@@ -723,6 +800,11 @@ void setup() {
     getTemperature();
     tempOld = -1;
     tempAlarmOld = -1;
+
+    // DHT22
+    pinMode(DHTPin, INPUT_PULLUP);
+    dht.begin();
+    extTempOld = -1;
 
     // LittleFS
     LittleFSConfig cfg;
@@ -785,8 +867,6 @@ void setup() {
     display.clearDisplay();
 }
 
-// TODO add external temp & humidity
-// TODO level sensor
 
 /*
  * loop
@@ -813,7 +893,7 @@ void loop() {
             display.display();
 
             // MQTT status & init if dropped
-            display.setCursor(96,56);
+            display.setCursor(48,56);
             display.print("M:");
             if(!mqttClient.connected()) {
                 Serial.println(F("Reconnecting MQTT."));
@@ -879,7 +959,7 @@ void loop() {
             const size_t capacity = JSON_OBJECT_SIZE(2);
             StaticJsonDocument<capacity> doc;
             JsonObject obj = doc.createNestedObject("DS18B20");
-            obj["Temperature"] = tempF;
+            obj["Temperature"] = round(tempF * 100) / 100;
             serializeJson(doc, buffer);
             mqttClient.publish(topic_status_temp, buffer, true);
         }
@@ -890,7 +970,7 @@ void loop() {
         Serial.print(F("Alarm: "));
         Serial.println(message_status_tempalarm[tempAlarm]);
 
-        display.setCursor(0,16);
+        display.setCursor(0,17);
         display.setTextSize(2);
         display.print(message_status_tempalarm[tempAlarm]);
         display.print(F(":"));
@@ -905,6 +985,66 @@ void loop() {
         display.print(F("F"));
         display.setTextColor(WHITE, BLACK);
         display.display();
+    }
+
+    // External Temperature retrieve & publish
+    if (getExtTempHum()) {
+        if(mqttClient.connected()) {
+            const size_t capacity = JSON_OBJECT_SIZE(4);
+            StaticJsonDocument<capacity> doc;
+            JsonObject obj = doc.createNestedObject("AM321");
+            obj["Temperature"] = round(extTempF * 100) / 100;
+            obj["Humidity"] = round(extHum * 10) / 10;
+            serializeJson(doc, buffer);
+            mqttClient.publish(topic_status_exttemp, buffer, true);
+        }
+
+        Serial.print(F("ExtTemp in Celsius: "));
+        if(isnan(extTempC)){
+            Serial.print(F("--.--"));
+        } else {
+            Serial.print(extTempC,2);
+        }
+
+        display.setCursor(0,36);
+        display.setTextSize(1);
+        display.print(F(" Ambient:"));
+        Serial.print(F("  ExtTemp in Fahrenheit: "));
+        if(isnan(extTempF) || extTempF == 0) {
+            display.print(F("--.--"));
+            Serial.println(F("--.--"));
+        } else {
+            display.print(extTempF,2);
+            Serial.println(extTempF,2);
+        }
+        display.println(F("F"));
+        display.print(F("Humidity:"));
+        Serial.print(F("External Humidity: "));
+        if(isnan(extHum) || extHum == 0) {
+            display.print(F("--.-"));
+            Serial.println(F("--.-"));
+        } else {
+            display.print(extHum,1);
+            Serial.println(extHum,1);
+        }
+        display.print(F("%"));
+        display.display();
+    }
+
+    // Water level sensor
+    if(digitalRead(levelSensor) != levelStatus){
+        levelStatus = digitalRead(levelSensor);
+        Serial.print(F("Level: "));
+        Serial.print(message_status_level[levelStatus]);
+        display.setCursor(96,56);
+        display.setTextSize(1);
+        display.print(F("L:"));
+        display.print(message_status_level[levelStatus]);
+        display.display();
+
+        if(mqttClient.connected()) {
+            mqttClient.publish(topic_status_level, message_status_level[levelStatus], true);
+        }
     }
 
     // Temperature manual reset
